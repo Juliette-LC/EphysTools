@@ -322,99 +322,100 @@ channelExtrct <- channelExtract
 #'   [[1]] numeric  Warm-up end time (s) — crop data to `time > [[1]]`.
 #'   [[2]] numeric vector  Mux-change times (s).  (if return_mux_times != NULL)
 #'   [[3]] data.frame (time, voltage) at each step. (if return_voltage_steps != NULL)
-warmUpDetector <- function(full_path,
-                           return_mux_times    = NULL,
-                           channel             = 1,
-                           bias_vol            = -5,
-                           return_voltage_steps = NULL,
-                           mux_count           = 4,
-                           voltage_program     = NULL,
-                           ...) {
+warmUpDetector = function(full_path, return_mux_times = NULL, channel = 1,
+                          bias_vol = -5, return_voltage_steps = NULL,
+                          mux_numb = 4,voltage_prog=NULL, ...) {
+  #' Function to remove chip warm-up data
+  #' Returns init_rmv time, mux change times, and optionally voltage changes
+  
+  #' mux_numb is number of muxes on device (4 for minION. May need to be changed if run crashed)
+  #' If automatic mux splitting is failing, try setting the voltage program by hand by passing
+  #' a vector to voltage_prog. Leave NULL for automatic detection
+  
   
   dots <- list(...)
-  
-  # Helper: call a function forwarding only args it accepts
-  safe_call <- function(fun, args) {
+  ## minor helpers for data import
+  ## these must be inside this function... else this fails, sigh...
+  safe_do <- function(fun, args) {
     do.call(fun, c(args, dots[names(dots) %in% names(formals(fun))]))
   }
+  safe_h5read <- function(path) safe_do(h5read, list(full_path, path))
   
-  # ── Load and scale raw signal ────────────────────────────────────────────────
-  message("warmUpDetector: reading channel ", channel, " from ", basename(full_path))
-  raw  <- data.frame(safe_call(rhdf5::h5read,
-                               list(full_path, paste0("/Raw/Channel_", channel, "/Signal"))))
-  meta <- data.frame(safe_call(rhdf5::h5readAttributes,
-                               list(full_path, paste0("/IntermediateData/Channel_", channel, "/Meta/"))))
+  ## Extract raw channel data
+  raw <- data.frame(safe_h5read(paste0("/Raw/Channel_", channel, "/Signal")))
+  meta_data <- data.frame(safe_do(h5readAttributes,
+                                  list(full_path, paste0("/IntermediateData/Channel_", channel, "/Meta/"))))
   
-  scale      <- meta$range / meta$digitisation
-  scaled_raw <- data.frame(current = (raw + meta$offset) * scale)
-  sample_idx <- seq(0, nrow(scaled_raw) - 1)
+  raw_unit <- meta_data$range / meta_data$digitisation
+  scaled_raw <- (raw + meta_data$offset) * raw_unit
+  names(scaled_raw) <- "current"
+  samp <- seq(0, nrow(scaled_raw) - 1)
   
-  device_meta <- data.frame(safe_call(rhdf5::h5read, list(full_path, "/Device/MetaData")))
+  ## Read device voltage
+  Meta <- data.frame(safe_h5read("/Device/MetaData"))
   
-  raw_df <- data.frame(
+  raw_final <- data.frame(
     current = scaled_raw$current,
-    time    = sample_idx / meta$sample_rate,
-    voltage = device_meta$bias_voltage * bias_vol
+    time    = samp / meta_data$sample_rate,
+    voltage = Meta$bias_voltage * bias_vol
   )
   
-  # ── Locate voltage transitions ───────────────────────────────────────────────
-  dt <- data.table::data.table(voltage = raw_df$voltage, index = seq_along(raw_df$voltage))
-  dt[, is_first := (voltage != data.table::shift(voltage, fill = voltage[1] - 1)),
-     by = data.table::rleid(voltage)]
+  dt <- data.table(voltage = raw_final$voltage, index = seq_along(raw_final$voltage))
+  dt[, is_first := (voltage != shift(voltage, fill = voltage[1] - 1)), by = rleid(voltage)]
   v_changes <- dt[is_first == TRUE, .(voltage, first_index = index)]
   
-  if (nrow(v_changes) < 2 && is.null(voltage_program)) {
-    warning("warmUpDetector: no voltage changes detected — cannot determine warm-up period.")
+  if (nrow(v_changes) < 2 & (is.null(voltage_prog))) {
+    warning("No voltage changes detected — this will go badly,")
     return(list(0, numeric(0)))
   }
-  
-  # ── Determine (or accept) the voltage programme ──────────────────────────────
-  v_seq <- v_changes$voltage
-  
-  if (is.null(voltage_program)) {
-    message("warmUpDetector: auto-detecting voltage programme (mux_count = ", mux_count, ")")
-    voltage_program <- find_pattern(v_seq, target_repeats = mux_count)
+  v_seq = v_changes$voltage
+  ## finding repeating pattern
+  if (is.null(voltage_prog)) {
+    message("Trying to automatically determine voltage program for mux switching...")
+    
+    voltage_prog <- find_pattern(v_seq, target_repeats = mux_numb)
+    
     message(
-      "  Detected programme: ", paste(voltage_program, collapse = " "),
-      "\n  Full sequence:      ", paste(v_seq, collapse = " "),
-      "\n  If incorrect, set `voltage_program` manually or adjust `mux_count`."
+      "Voltage program determined as:\n",
+      paste(voltage_prog, collapse = " "),  # clean pattern output
+      "\n\nIf this is not correct, set it manually using `voltage_prog` parameter ",
+      "or by changing `mux_numb`. (currently set to)", mux_numb, "\n",
+      "Complete voltage sequence from this is:\n",
+      paste(v_seq, collapse = " ")  # clean full sequence output
     )
   }
   
-  vp_len <- length(voltage_program)
-  
-  # ── Assign mux labels and locate the warm-up zero step ──────────────────────
+  vp_len = length(voltage_prog)
+  ## assigning muxes
   v_changes[, mux := (seq_len(.N) - 1) %/% vp_len + 1]
+  rows_zero = which(v_changes$voltage==0)
+  ## remove initial zero as that contains the warm up step
+  rows_zero = rows_zero[2:length(rows_zero)]
+  ## calculate avg number of rows of zero step
+  z_step_lengths =unlist(v_changes$first_index[rows_zero] - unlist(v_changes$first_index[rows_zero -1]) )
+  ## take avg (bit hacky, but considering number of data points, should not matter)
+  zero_step_index_len = mean(na.omit(z_step_lengths))
+  ## now we can use that to calculate the length in index of the warm up step
+  init_v_change = v_changes[2,2]
+  init_z_step_start = init_v_change-zero_step_index_len
+  ## now add a new entry in v_changes for the warm up, will call mux zero
+  v_changes = rbind(data.table(voltage=0,first_index=0,mux=0), v_changes)
+  ## now adjust mux 1 start time
+  v_changes$first_index[v_changes$mux==1][1] =  init_z_step_start
+  ## v_changes[2,] is now the index of the voltage start
+  ## Output warm-up removal time
+  init_rmv = raw_final$time[unlist(v_changes[2,2])]
   
-  zero_rows      <- which(v_changes$voltage == 0)
-  zero_rows      <- zero_rows[-1]   # first zero is the warm-up; skip it
-  zero_lengths   <- unlist(v_changes$first_index[zero_rows] -
-                             unlist(v_changes$first_index[zero_rows - 1]))
-  zero_step_len  <- mean(stats::na.omit(zero_lengths))
-  
-  init_v_change      <- v_changes[2, 2]
-  warm_up_start_idx  <- init_v_change - zero_step_len
-  
-  # Prepend a mux-0 entry for the warm-up period, then adjust mux-1 start
-  v_changes <- rbind(
-    data.table::data.table(voltage = 0, first_index = 0, mux = 0),
-    v_changes
-  )
-  v_changes$first_index[v_changes$mux == 1][1] <- warm_up_start_idx
-  
-  init_rmv        <- raw_df$time[unlist(v_changes[2, 2])]
-  message("warmUpDetector: warm-up end time = ", round(init_rmv, 2), " s")
-  
-  # ── Mux change times ─────────────────────────────────────────────────────────
-  mux_change_idx   <- v_changes$first_index[c(TRUE, diff(v_changes$mux) != 0)]
-  mux_change_times <- raw_df$time[unlist(mux_change_idx)]
+  ## Timepoints where mux changes
+  mux_change_index = v_changes$first_index[c(TRUE, diff(v_changes$mux) != 0)]
+  mux_change_times = raw_final$time[unlist(mux_change_index)] ## include mux 5 so final voltage zero is removed when performing cm selection
   
   if (!is.null(return_voltage_steps)) {
-    voltage_steps_df <- raw_df[unlist(v_changes$first_index), c("time", "voltage")]
-    return(list(init_rmv, mux_change_times, voltage_steps_df))
+    voltage_changes_df <- raw_final[unlist(v_changes$first_index), c("time", "voltage")]
+    return(list(init_rmv, mux_change_times, voltage_changes_df))
+  } else {
+    return(list(init_rmv, mux_change_times))
   }
-  
-  return(list(init_rmv, mux_change_times))
 }
 
 
@@ -2055,19 +2056,16 @@ eventPlotr <- function(input_df,
 #' @param fit_colour     character/NULL  Fit line colour. NULL -> coloured by group.
 #' @param drop_zero_v    logical      TRUE (default) drops voltage = 0 rows.
 #' @param output         character    "plot" returns ggplot; "data" returns the
-#'                                    filtered plot data.frame; "agg_data" returns
-#'                                    a list of plot_df, rep_df, and err_df for
-#'                                    debugging aggregation (default: "plot").
+#'                                    filtered plot data.frame (default: "plot").
 #'
-#' @return ggplot object, data.frame, or named list depending on \code{output}.
+#' @return ggplot object or data.frame depending on \code{output}.
 #'
 #' @examples
 #' \dontrun{
 #' ivPlot(df)                              # colour by cond_group (default)
 #' ivPlot(df, colour_by = "id")            # colour by id column
 #' ivPlot(df, colour_by = "treatment")     # colour by any other column
-#' ivPlot(df, colour_by = "voltage")       # colour by voltage (discrete)
-#' ivPlot(df, output = "agg_data")         # return aggregation internals for QC
+#' ivPlot(df, output = "data")             # return plot data for inspection
 #' }
 ivPlot <- function(input_df,
                    colour_by    = NULL,
@@ -2083,7 +2081,7 @@ ivPlot <- function(input_df,
                    marker_size  = 1,
                    offset_zero  = FALSE,
                    txt_size     = 7,
-                   fit_colour   = TRUE,
+                   fit_colour   = NULL,
                    drop_zero_v  = TRUE,
                    output       = "plot") {
   
@@ -2092,12 +2090,11 @@ ivPlot <- function(input_df,
     input_df$cond_group <- if ("id" %in% names(input_df)) input_df$id else "ungrouped"
   
   # --- Resolve colour column -------------------------------------------------
-  # Priority: explicit colour_by arg > cond_group > id > "ungrouped"
   colour_col <- .resolve_colour_col(input_df, colour_by,
                                     default_order = c("cond_group", "id"))
   message("ivPlot: colouring by '", colour_col, "'")
   
-  # Validate plot_groups against the resolved colour column
+  # --- Validate plot_groups against the resolved colour column ---------------
   if (is.null(plot_groups)) {
     plot_groups <- unique(input_df[[colour_col]])
   } else {
@@ -2114,118 +2111,77 @@ ivPlot <- function(input_df,
   input_df$per_voltage_current <- as.numeric(input_df$per_voltage_current)
   input_df$voltage             <- as.numeric(input_df$voltage)
   
+  # --- Validate fit_voltage range -----------------------------------------------
   if (is.null(fit_voltage)) fit_voltage <- range(input_df$voltage)
   fit_voltage <- seq(fit_voltage[1L], fit_voltage[2L])
   
-  # --- Aggregate current per voltage step ------------------------------------
-  # The replicate unit is `cm` (one channel-mux = one pore).
-  # Each cm has one current value per voltage step from insertionAnalyser.
-  # We want:
-  #   - plotted point = mean across cms within a group, per voltage
-  #   - error         = sd (or sem) across those cms, per voltage
-  #
-  # colour_col groups the cms (e.g. "treatment", "cond_group").
-  # If colour_col IS "cm", each cm is its own group -> no replicates -> no error.
-  
+  # --- Aggregate current per voltage step and group ----------------------------
+  # Following the old working logic: aggregate by voltage and colour_col directly
+  # This avoids multi-step aggregation issues
   avg_fn <- if (avg_type == "mode") modalAvg else get(avg_type)
   
-  # Identify the replicate column: prefer "cm", fall back to "id", else NULL
-  rep_col <- if ("cm" %in% names(input_df)) "cm" else
-    if ("id" %in% names(input_df) && colour_col != "id") "id" else
-      NULL
+  # Build grouping variables for aggregation
+  grp_vars <- c("voltage", colour_col)
+  agg_formula <- stats::reformulate(grp_vars, "per_voltage_current")
   
-  if (!is.null(rep_col) && colour_col != rep_col) {
-    # Step 1: per-replicate average within cm x colour_col x voltage
-    # (handles case where input has multiple raw rows per cm per voltage)
-    rep_formula <- reformulate(c(rep_col, colour_col, "voltage"),
-                               "per_voltage_current")
-    rep_df <- stats::aggregate(rep_formula, input_df, avg_fn)
-  } else {
-    # colour_by IS the replicate column - no within-group replicates exist
-    message("ivPlot: colour_by = '", colour_col, "' is the replicate column — ",
-            "error bars will be NA (no replicates within each group).")
-    rep_df <- input_df[, intersect(c(colour_col, "voltage", "per_voltage_current"),
-                                   names(input_df))]
-  }
+  # Aggregate to mean per voltage x colour group
+  plot_df <- stats::aggregate(agg_formula, data = input_df, FUN = avg_fn)
   
-  if (isTRUE(offset_zero) && any(rep_df$voltage == 0)) {
-    ## zero offsetting in per colour_col manner
-    zero_formula <- reformulate(colour_col, "per_voltage_current")
-    
-    zero_df <- stats::aggregate(
-      zero_formula,
-      data = rep_df[rep_df$voltage == 0, , drop = FALSE],
-      FUN  = mean
-    )
-    
-    names(zero_df)[names(zero_df) == "per_voltage_current"] <- "zero_current"
-    
-    # Merge offsets back onto rep_df
-    rep_df <- merge(rep_df, zero_df,
-                    by = colour_col,
-                    all.x = TRUE)
-    
-    # Apply group-wise offset
-    rep_df$per_voltage_current <-
-      rep_df$per_voltage_current - rep_df$zero_current
-    
-    # Cleanup helper column
-    rep_df$zero_current <- NULL
-  }
+  # --- Compute error bars (SEM or SD) atomically --------------------------------
+  # Compute stdev per voltage x colour_col
+  stdev_df <- stats::aggregate(agg_formula, data = input_df, FUN = sd)
+  names(stdev_df)[names(stdev_df) == "per_voltage_current"] <- "stdev"
   
-  # Step 2: compute sd, n, and sem atomically in a single aggregate call so
-  # all three statistics are guaranteed to reflect the same set of valid
-  # observations per voltage x colour_col cell.
-  err_formula <- reformulate(c("voltage", colour_col), "per_voltage_current")
+  # Count observations per voltage x colour_col
+  n_df <- stats::aggregate(agg_formula, data = input_df, FUN = length)
+  names(n_df)[names(n_df) == "per_voltage_current"] <- "n"
   
-  err_df <- stats::aggregate(err_formula, rep_df, function(x) {
-    valid <- x[!is.na(x)]
-    n     <- length(valid)
-    stdev <- sd(valid)
-    c(stdev = stdev, n = n, sem = stdev / sqrt(n))
-  })
+  # Merge stdev and n back onto plot_df
+  plot_df <- merge(plot_df, stdev_df, by = grp_vars, all.x = TRUE)
+  plot_df <- merge(plot_df, n_df,     by = grp_vars, all.x = TRUE)
   
-  # Unpack the matrix column produced by aggregate's multi-value FUN
-  err_df <- do.call(data.frame, list(
-    err_df[, c("voltage", colour_col)],
-    stdev = err_df$per_voltage_current[, "stdev"],
-    n     = err_df$per_voltage_current[, "n"],
-    sem   = err_df$per_voltage_current[, "sem"]
-  ))
+  # Compute SEM
+  plot_df$sem <- plot_df$stdev / sqrt(plot_df$n)
   
-  # Step 3: mean of per-replicate values -> one plotted point per voltage x group
-  plot_formula <- reformulate(c("voltage", colour_col), "per_voltage_current")
-  plot_df      <- stats::aggregate(plot_formula, rep_df, mean)
-  plot_df      <- merge(plot_df, err_df, by = c("voltage", colour_col))
-  
-  # Diagnostic: report per-voltage n range per group, flag unbalanced designs
-  message("ivPlot: n replicates per voltage x group (range per group):")
-  for (grp in unique(err_df[[colour_col]])) {
-    ns <- err_df$n[err_df[[colour_col]] == grp]
+  # Diagnostic: report per-voltage n range per group
+  message("ivPlot: n observations per voltage x group (range per group):")
+  for (grp in unique(plot_df[[colour_col]])) {
+    ns <- plot_df$n[plot_df[[colour_col]] == grp]
     message("  ", grp, ": ", min(ns), "-", max(ns),
             if (min(ns) != max(ns)) " (UNBALANCED - check for missing voltage steps)" else "")
   }
   
-  # --- Filter to selected groups ---------------------------------------------
-  ap_df <- plot_df[plot_df[[colour_col]] %in% plot_groups, , drop = FALSE]
+  # --- Filter to selected groups -----------------------------------------------
+  plot_df <- plot_df[plot_df[[colour_col]] %in% plot_groups, , drop = FALSE]
   
+  # --- Apply offset correction (V=0 -> I=0) per group -------------------------
+  if (isTRUE(offset_zero) && any(plot_df$voltage == 0)) {
+    message("ivPlot: applying offset correction (subtracting mean current at V=0 per group)")
+    for (grp in unique(plot_df[[colour_col]])) {
+      zero_idx <- which(plot_df$voltage == 0 & plot_df[[colour_col]] == grp)
+      if (length(zero_idx) > 0L) {
+        zero_val <- plot_df$per_voltage_current[zero_idx]
+        plot_df$per_voltage_current[plot_df[[colour_col]] == grp] <-
+          plot_df$per_voltage_current[plot_df[[colour_col]] == grp] - zero_val
+      }
+    }
+  }
+  
+  # --- Drop voltage = 0 rows if requested--------------------------------------
   if (isTRUE(drop_zero_v)) {
-    message("ivPlot: dropping voltage = 0 rows (note: affects offset_zero correction)")
-    ap_df <- ap_df[ap_df$voltage != 0, , drop = FALSE]
+    message("ivPlot: dropping voltage = 0 rows")
+    plot_df <- plot_df[plot_df$voltage != 0, , drop = FALSE]
   }
   
-  # Return aggregation internals for QC without building the plot
-  if (output == "agg_data") {
-    return(list(plot_df = plot_df, rep_df = rep_df, err_df = err_df))
-  }
+  # --- Return plot data if requested -------------------------------------------
+  if (output == "data") return(plot_df)
   
-  if (output == "data") return(ap_df)
-  
+  # --- Prepare error bar aesthetic ---------------------------------------------
   err_col <- if (tolower(error_type) == "stdev") "stdev" else "sem"
   
-  # --- Build plot ------------------------------------------------------------
+  # --- Build plot base --------------------------------------------------------
   plt <- ggplot2::ggplot(
-    ap_df,
+    plot_df,
     ggplot2::aes(
       x      = voltage,
       y      = per_voltage_current,
@@ -2246,34 +2202,53 @@ ivPlot <- function(input_df,
     My_Theme(base_size = txt_size, txt_size = txt_size) +
     ggplot2::theme(legend.title = ggplot2::element_blank())
   
-  # --- Conductance fit -------------------------------------------------------
-  plot_df$cond <- plot_df$per_voltage_current / plot_df$voltage
-  
+  # --- Conductance fit and reporting -------------------------------------------
   if (isTRUE(show_fit)) {
+    # Compute conductance (I/V)
+    plot_df$conductance <- plot_df$per_voltage_current / plot_df$voltage
+    
+    # Report conductance statistics per group to console
+    message("ivPlot: conductance summary per group")
     for (grp in unique(plot_df[[colour_col]])) {
-      tmp   <- stats::na.omit(plot_df[plot_df[[colour_col]] == grp, ])
-      tmp   <- tmp[!is.infinite(tmp$cond), ]
-      tmp$y <- tmp$per_voltage_current
-      tmp$x <- tmp$voltage
-      model <- try(stats::lm(
-        formula = as.formula(fit_formula),
-        data    = tmp[tmp$voltage %in% fit_voltage, ]
-      ), silent = TRUE)
+      tmp <- plot_df[plot_df[[colour_col]] == grp, ]
       
-      message("ivPlot: conductance for '", colour_col, " = ", grp, "'")
-      if (!inherits(model, "try-error")) {
-        message("  Linear fit:")
-        print(summary(model)$coefficients)
-        message("  Modal average: ", round(modalAvg(tmp$cond), 4),
-                " \u00b1 ", round(sd(tmp$cond), 4), " nS")
-      } else {
-        message("  Fit failed for this group.")
+      # Remove infinite and NA values
+      tmp <- tmp[!is.na(tmp$conductance) & !is.infinite(tmp$conductance), ]
+      
+      if (nrow(tmp) > 0L) {
+        # Fit model within voltage range
+        tmp_fit <- tmp[tmp$voltage %in% fit_voltage, ]
+        
+        if (nrow(tmp_fit) > 0L) {
+          # Set up data for lm
+          tmp_fit$y <- tmp_fit$per_voltage_current
+          tmp_fit$x <- tmp_fit$voltage
+          
+          model <- try(
+            stats::lm(formula = as.formula(fit_formula), data = tmp_fit),
+            silent = TRUE
+          )
+          
+          message("  '", colour_col, " = ", grp, "':")
+          if (!inherits(model, "try-error")) {
+            message("    Linear fit (", fit_formula, "):")
+            print(summary(model)$coefficients)
+            message("    Modal avg: ", round(modalAvg(tmp$conductance), 4),
+                    " ± ", round(sd(tmp$conductance), 4), " nS")
+          } else {
+            message("    Fit failed for this group.")
+          }
+        } else {
+          message("  '", colour_col, " = ", grp, "': no data in fit voltage range.")
+        }
       }
     }
     
-    fit_df <- ap_df[ap_df$voltage %in% fit_voltage, , drop = FALSE]
+    # Overlay fit line(s)
+    fit_df <- plot_df[plot_df$voltage %in% fit_voltage, , drop = FALSE]
     
-    if (isTRUE(fit_colour)) {
+    if (is.null(fit_colour)) {
+      # Colour fit by group
       plt <- plt + ggplot2::geom_smooth(
         data      = fit_df,
         ggplot2::aes(colour = .data[[colour_col]]),
@@ -2283,6 +2258,7 @@ ivPlot <- function(input_df,
         linewidth = marker_size
       )
     } else {
+      # Use fixed colour for fit line
       plt <- plt + ggplot2::geom_smooth(
         data      = fit_df,
         method    = "lm",
@@ -2294,19 +2270,28 @@ ivPlot <- function(input_df,
     }
   }
   
-  if (!is.null(cols))      plt <- plt + ggplot2::scale_colour_manual(values = cols) +
+  # --- Apply manual colour scale if provided -----------------------------------
+  if (!is.null(cols))
+    plt <- plt + ggplot2::scale_colour_manual(values = cols) +
     ggplot2::scale_fill_manual(values = cols)
-  if (!is.null(plot_ylim)) plt <- plt + ggplot2::scale_y_continuous(
-    breaks = stefBreaks(plot_ylim)[[1L]],
-    labels = stefBreaks(plot_ylim)[[2L]], limits = plot_ylim)
-  if (!is.null(plot_xlim)) plt <- plt + ggplot2::scale_x_continuous(
-    breaks = stefBreaks(plot_xlim)[[1L]],
-    labels = stefBreaks(plot_xlim)[[2L]], limits = plot_xlim)
+  
+  # --- Apply axis limits and breaks if provided --------------------------------
+  if (!is.null(plot_ylim))
+    plt <- plt + ggplot2::scale_y_continuous(
+      breaks = stefBreaks(plot_ylim)[[1L]],
+      labels = stefBreaks(plot_ylim)[[2L]],
+      limits = plot_ylim
+    )
+  
+  if (!is.null(plot_xlim))
+    plt <- plt + ggplot2::scale_x_continuous(
+      breaks = stefBreaks(plot_xlim)[[1L]],
+      labels = stefBreaks(plot_xlim)[[2L]],
+      limits = plot_xlim
+    )
   
   return(plt)
 }
-
-
 
 # =============================================================================
 
