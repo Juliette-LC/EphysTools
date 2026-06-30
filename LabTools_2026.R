@@ -972,10 +972,10 @@ barPlotr <- function(input_df,
   
   if (err_mode %in% c("full", "y", "yes")) {
     input_df$ymax <- input_df$y + input_df$stdev
-    input_df$ymin <- input_df$y
+    input_df$ymin <- input_df$y - input_df$stdev
   } else if (err_mode %in% c("half", "0.5")) {
     input_df$ymax <- input_df$y + 0.5 * input_df$stdev
-    input_df$ymin <- input_df$y
+    input_df$ymin <- input_df$y - 0.5 * input_df$stdev
   }
   
   plt <- ggplot2::ggplot(
