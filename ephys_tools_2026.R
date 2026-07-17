@@ -1359,10 +1359,13 @@ eventDetect <- function(input_df,
       sd_curr  <- stats::sd(ev$current, na.rm = TRUE)
       if (is.na(sd_curr)) sd_curr <- 0
       
-      amplitude <- tryCatch(
-        100 * norm(c(zero_curr, avg_curr, ev$opc[1]), type = "2"),
-        error = function(e) 100 * abs(avg_curr / ev$opc[1])
-      )
+    amplitude <- tryCatch({
+      denom <- ev$opc[1] - zero_curr
+      if (denom == 0) stop("opc equals zero-current baseline")
+      100 * (avg_curr - zero_curr) / denom
+      },
+      error = function(e) 100 * avg_curr / ev$opc[1]
+    )
       
       event_counter <- event_counter + 1L
       events_list[[event_counter]] <- data.table::data.table(
