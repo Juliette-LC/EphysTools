@@ -1,18 +1,10 @@
-# =============================================================================
-# JLC Lab Tools
-# =============================================================================
+
 # General-purpose utilities for data import, processing, plotting, and
 # quantification used across the JLC/Howorka lab.
 #
-# Conventions used throughout:
-#   - Data frames passed as the primary argument are always named `input_df`
-#   - Boolean-like parameters use TRUE/FALSE or NULL (not "y"/"n" strings)
-#   - File paths constructed with file.path() where possible
-#   - message() used for progress; warning() for recoverable issues
-# =============================================================================
 
 
-# ── Section 0: Package Setup ──────────────────────────────────────────────────
+
 
 .jlc_pkgs <- c(
   "ggplot2", "grid", "gridExtra", "cowplot", "zoo",
@@ -24,11 +16,9 @@ if (length(.not_installed)) install.packages(.not_installed)
 invisible(lapply(.jlc_pkgs, require, character.only = TRUE))
 
 
-# ── Section 1: Global Theme Elements ─────────────────────────────────────────
 
-#' ggplot2 theme modifier: remove all facet strip labels
+#' Remove panel labels from facet plots
 #'
-#' Add to any ggplot to strip facet labels while keeping panel borders.
 #' Usage: `my_plot + strip_blank`
 lab_rmv <- ggplot2::theme(
   strip.background   = ggplot2::element_blank(),
@@ -38,10 +28,8 @@ lab_rmv <- ggplot2::theme(
   strip.background.y = ggplot2::element_blank()
 )
 
-#' ggplot2 theme modifier: clean up ggside margin panels
-#'
 #' Removes gridlines, backgrounds, borders, and axis decorations from
-#' ggside marginal panels. Add to plots that use geom_xsidedensity etc.
+#' ggside marginal panels.
 #' Usage: `my_plot + side_panel_clean`
 side_panel_clean <- ggplot2::theme(
   ggside.panel.grid       = ggplot2::element_blank(),
@@ -51,7 +39,6 @@ side_panel_clean <- ggplot2::theme(
   ggside.axis.ticks       = ggplot2::element_blank()
 )
 
-# Global font size defaults — change these to rescale all plots uniformly
 .txt_size <- 12
 .txt_fam  <- "sans"
 
@@ -92,8 +79,7 @@ My_Theme <- function(base_size = 12, txt_size = 12, base_family = "sans") {
 }
 
 
-#' Lab ggplot2 theme (ggthemes::theme_few base)
-#'
+
 #' Alternative minimal theme. Otherwise identical signature to My_Theme.
 #'
 #' @param base_size   numeric  Base font size (default: 12).
@@ -125,8 +111,6 @@ stefTheme <- function(base_size = 12, txt_size = 12, base_family = "sans") {
 }
 
 
-# ── Section 2: Utility Functions ─────────────────────────────────────────────
-
 #' Min-max normalise a numeric vector to [0, 1]
 #'
 #' @param x  numeric  Vector to normalise.
@@ -156,44 +140,288 @@ avg <- function(col_list, id) {
 }
 
 
-#' Rolling mean and SD on the second column of a data frame
+#' Rolling mean and SD across multiple y columns of a data frame
 #'
-#' Computes a block rolling mean and SD, then decimates to one row per block
-#' so the output has ~1/block as many rows as the input.
+#' Computes a centred rolling mean and SD for each y column.
 #'
-#' @param input_df  data.frame  Two-column (x, y) input.
-#' @param block     integer  Rolling window size (default: 5).
-#' @param id        character  Label appended as the `id` column.
+#' The smoothing window can be specified in physical time using
+#' `smooth_width`, in ns. The function automatically determines the
+#' timestep from the spacing between rows and converts the requested
+#' smoothing width into an appropriate number of data points.
 #'
-#' @return data.frame with columns: x, y (rolling mean), stdev (rolling SD), id.
-run_avg <- function(input_df, block = 5, id = "id_missing") {
+#' The x column is assumed to contain time in ns. If the sampling
+#' timestep cannot or should not be inferred from x, it can be supplied
+#' manually using `timestep_ps`, in ps.
+#'
+#' For example, if the trajectory has a timestep of 0.1 ns,
+#' `smooth_width = 5` corresponds to approximately 51 data points.
+#' If the trajectory is sampled every 1 ps, the same 5 ns smoothing
+#' window corresponds to approximately 5001 data points.
+#'
+#' If `smooth_width = NULL`, the legacy `block` argument is used instead.
+#'
+#' Any non-numeric column other than x_col is auto-detected as a grouping
+#' column (e.g. "id", "region", or both). The data is split by the unique
+#' combination of those columns, and the rolling mean is applied within
+#' each group.
+#'
+#' @param input_df data.frame Input containing an x column, one or more
+#'   y columns, and optionally one or more grouping columns.
+#' @param block integer Legacy rolling window size in data points.
+#'   Only used when smooth_width = NULL. Default: 5.
+#' @param x_col character or integer Name or index of the x column.
+#' @param id character Label used to create an `id` column when no grouping
+#'   column already produces one.
+#' @param group_cols character vector Names of columns to group by.
+#'   If NULL (default), auto-detected as every non-numeric column other
+#'   than x_col.
+#' @param timestep_ps numeric Optional manually supplied timestep in ps.
+#'   If NULL (default), the timestep is automatically calculated from
+#'   the spacing between x values. The x column is assumed to be in ns.
+#' @param smooth_width numeric Width of smoothing window in ns.
+#'   Default: 1 ns. Set to NULL to use the legacy `block` argument.
+#'
+#' @return data.frame with columns: x, y (rolling mean), stdev
+#'   (rolling SD), variable (source y column name), any grouping columns,
+#'   and id.
+run_avg <- function(input_df,
+                    block = 5,
+                    x_col = 1,
+                    id = "id_missing",
+                    group_cols = NULL,
+                    timestep_ps = NULL,
+                    smooth_width = 1) {
+
   
-  # Core computation (unchanged)
-  .compute <- function(df, id_val) {
-    rm_vals   <- zoo::rollmean(df[, 2], k = block, na.pad = TRUE)
-    sd_vals   <- zoo::rollapply(df[, 2], width = block, FUN = sd, fill = NA)
-    out       <- data.frame(df[, 1], rm_vals, sd_vals)
-    out       <- out[seq(2, nrow(out), block), ]
-    names(out) <- c("x", "y", "stdev")
-    out$id    <- id_val
-    return(out)
-  }
-  
-  # Auto-detect id column (looks for a column literally named "id")
-  if ("id" %in% tolower(names(input_df))) {
-    id_col  <- which(tolower(names(input_df)) == "id")
-    id_vals <- unique(input_df[, id_col])
-    
-    results <- lapply(id_vals, function(i) {
-      subset_df <- input_df[input_df[, id_col] == i, -id_col]
-      .compute(subset_df, id_val = i)
-    })
-    
-    return(do.call(rbind, results))
-    
+  if (is.numeric(x_col)) {
+    x_pos <- x_col
+    x_name <- names(input_df)[x_pos]
   } else {
-    return(.compute(input_df, id_val = id))
+    x_name <- x_col
+    if (!(x_name %in% names(input_df))) {
+      stop(
+        "run_avg: x_col '",
+        x_name,
+        "' not found in input_df."
+      )
+    }
   }
+
+  
+  nm <- names(input_df)
+  if (is.null(nm)) {
+    nm <- rep("", ncol(input_df))
+  }
+  missing_nm <- is.na(nm) | nm == ""
+  if (any(missing_nm)) {
+    nm[missing_nm] <- paste0(
+      "y",
+      seq_len(sum(missing_nm))
+    )
+    names(input_df) <- make.unique(nm)
+    
+    message(
+      "run_avg: ",
+      sum(missing_nm),
+      " column(s) had missing names; auto-assigned ",
+      paste(nm[missing_nm], collapse = ", "),
+      "."
+    )
+  }
+  
+
+  if (is.null(group_cols)) {
+    
+    group_cols <- names(input_df)[
+      names(input_df) != x_name &
+        !sapply(input_df, is.numeric)
+    ]
+  } else {
+    
+    missing_groups <- setdiff(
+      group_cols,
+      names(input_df)
+    )
+    if (length(missing_groups) > 0) {
+      stop(
+        "run_avg: group_cols not found in input_df: ",
+        paste(missing_groups, collapse = ", ")
+      )
+    }
+  }
+  
+  .compute <- function(df) {
+
+    y_cols <- setdiff(
+      names(df),
+      c(x_name, group_cols)
+    )
+    y_cols <- y_cols[
+      sapply(
+        df[y_cols],
+        is.numeric
+      )
+    ]
+    if (length(y_cols) == 0) {
+      stop(
+        "run_avg: no numeric y columns found besides x_col '",
+        x_name,
+        "'."
+      )
+    }
+
+    x_vals <- df[[x_name]]
+
+    if (!is.null(smooth_width)) {
+      dx <- median(
+        diff(x_vals),
+        na.rm = TRUE
+      )
+      if (!is.finite(dx) || dx <= 0) {
+        stop(
+          "run_avg: could not determine a valid timestep from x_col."
+        )
+      }
+      
+      if (is.null(timestep_ps)) {
+        
+        timestep_ns <- dx
+        message(
+          "run_avg: timestep automatically detected as ",
+          signif(timestep_ns, 6),
+          " ns."
+        )
+      } else {
+        
+        if (!is.numeric(timestep_ps) ||
+            length(timestep_ps) != 1 ||
+            !is.finite(timestep_ps) ||
+            timestep_ps <= 0) {
+          stop(
+            "run_avg: timestep_ps must be a single positive numeric value."
+          )
+        }
+        timestep_ns <- timestep_ps / 1000
+        message(
+          "run_avg: timestep manually supplied as ",
+          signif(timestep_ps, 6),
+          " ps (",
+          signif(timestep_ns, 6),
+          " ns)."
+        )
+      }
+      block <- round(
+        smooth_width / timestep_ns
+      )
+      if (block %% 2 == 0) {
+        block <- block + 1
+      }
+      block <- max(
+        block,
+        3
+      )
+     message(
+        "run_avg: smoothing = ",
+        smooth_width,
+        " ns; block = ",
+        block,
+        " points."
+      )
+    }
+    
+    result_list <- lapply(
+      y_cols,
+      function(y_name) {
+        
+        y_vals <- df[[y_name]]
+        rm_vals <- rollmean(
+          y_vals,
+          k = block,
+          fill = NA,
+          align = "center"
+        )
+        sd_vals <- rollapply(
+          y_vals,
+          width = block,
+          FUN = sd,
+          fill = NA,
+          align = "center"
+        )
+        
+        out <- data.frame(
+          x        = x_vals,
+          y        = rm_vals,
+          stdev    = sd_vals,
+          variable = y_name,
+          stringsAsFactors = FALSE
+        )
+        
+        out
+      }
+    )
+    
+    out_df <- do.call(
+      rbind,
+      result_list
+    )
+    rownames(out_df) <- NULL
+    out_df
+  }
+  
+ if (length(group_cols) > 0) {
+    
+    grp_key <- do.call(
+      interaction,
+      c(
+        as.list(input_df[group_cols]),
+        list(
+          drop = TRUE,
+          sep = "_"
+        )
+      )
+    )
+  
+    results <- lapply(
+      split(input_df, grp_key),
+      function(sub_df) {
+        
+        if (nrow(sub_df) == 0) {
+          return(NULL)
+        }
+        
+        out <- .compute(sub_df)
+        
+        
+        # Carry grouping variables through
+        for (gc in group_cols) {
+          out[[gc]] <- sub_df[[gc]][1]
+        }
+        
+        out
+      }
+    )
+    out_df <- do.call(
+      rbind,
+      results
+    )
+    rownames(out_df) <- NULL
+  } else {
+    
+    out_df <- .compute(
+      input_df
+    )
+  }
+  
+  
+  # ==========================================================
+  # Backwards compatibility
+  # ==========================================================
+  
+  if (!("id" %in% names(out_df))) {
+    out_df$id <- id
+  }
+  
+  out_df
 }
 
 
@@ -207,7 +435,6 @@ endSlash <- function(path) {
   return(path)
 }
 
-
 #' Row-bind two data frames with different columns (fills missing with NA)
 #'
 #' @param x  data.frame
@@ -220,7 +447,6 @@ rbind_fill <- function(x, y) {
   y[setdiff(all_cols, names(y))] <- NA
   rbind(x[all_cols], y[all_cols])
 }
-
 
 #' Generate axis breaks and labels in Howorka-group publication style
 #'
@@ -282,14 +508,6 @@ stefXY <- function(xlim, ylim) {
 }
 
 
-#' Round up to the nearest power of ten
-#'
-#' @param x  numeric  Value to round up.
-#'
-#' @return numeric  Smallest power of 10 ≥ x.
-roundUp <- function(x) 10^ceiling(log10(x))
-
-
 #' Generate a colour ramp between two colours
 #'
 #' Thin wrapper around colorRampPalette for convenience.
@@ -302,7 +520,6 @@ roundUp <- function(x) 10^ceiling(log10(x))
 colRampR <- function(col1, col2, n_cols) {
   colorRampPalette(c(col1, col2))(n_cols)
 }
-
 
 #' Continuous modal average via kernel density estimation
 #'
@@ -566,7 +783,7 @@ cuvette_framer <- function(file_list,
 }
 
 
-#' Read a 96-well plate fluorescence file (xlsx) into a tidy data frame
+#' Read a 96-well plate fluorescence file (xlsx) into a data frame
 #'
 #' Subsets the raw Excel output to the data region and attaches well labels
 #' (A1, B2, …). Designed for use with mapply over a list of plate files.
@@ -612,202 +829,34 @@ read_96well_plate <- function(data_path,
 }
 
 
-# ── Section 4: Plotting ───────────────────────────────────────────────────────
-#' 
-#' #' General-purpose xy scatter / line plot
-#' #'
-#' #' Builds a ggplot2 line or point plot from a data frame. Supports error
-#' #' ribbons or bars, manual colours, faceting, log axes, and axis limits.
-#' #'
-#' #' @param input_df    data.frame  Must contain columns named by `xvar` and
-#' #'                     `yvar`. For error display it also needs a `stdev` column.
-#' #' @param xvar        character  Column name for the x axis (default: "x").
-#' #' @param yvar        character  Column name for the y axis (default: "y").
-#' #' @param xlab        character/NULL  X axis label. NULL defaults to `xvar`.
-#' #' @param ylab        character/NULL  Y axis label. NULL defaults to `yvar`.
-#' #' @param colour_by   character  Column used for colour/fill grouping
-#' #'                     (default: "id").
-#' #' @param leg_loc     character  Legend position: "right", "left", "top",
-#' #'                     "bottom", or "none" (default: "right").
-#' #' @param error       character  Error display: "full" → full ±SD,
-#' #'                     "half" → ±0.5 SD, "none" → no error (default: "none").
-#' #' @param error_type  character  "ribbon" (default) or "errorbar".
-#' #' @param cols        character/NULL  Manual colour values (recycled if short).
-#' #' @param facet       character/NULL  Column name to facet by (rows ~ facet).
-#' #' @param marker      character  "line" (default) or "point".
-#' #' @param marker_size numeric  Geom size (default: 1).
-#' #' @param n_ticks     integer  Approximate number of x-axis breaks (default: 10).
-#' #' @param log         character  Log-scale axes: "x", "y", or "none" (default).
-#' #' @param sci_notation logical  TRUE enables scientific notation on axes
-#' #'                     (default: FALSE — plain number format).
-#' #' @param leg_title   character/NULL  Legend title. NULL removes the title.
-#' #' @param plot_ylim   numeric/NULL  Y axis limits c(min, max).
-#' #' @param plot_xlim   numeric/NULL  X axis limits c(min, max).
-#' #' @param txt_size    numeric  Base font size passed to My_Theme (default: 12).
-#' #'
-#' #' @return ggplot2 object.
-#' plotr <- function(input_df,
-#'                   xvar         = "x",
-#'                   yvar         = "y",
-#'                   xlab         = NULL,
-#'                   ylab         = NULL,
-#'                   colour_by    = "id",
-#'                   leg_loc      = "right",
-#'                   error        = "none",
-#'                   error_type   = "ribbon",
-#'                   cols         = NULL,
-#'                   facet        = NULL,
-#'                   marker       = "line",
-#'                   marker_size  = 1,
-#'                   n_ticks      = 10,
-#'                   log          = "none",
-#'                   sci_notation = FALSE,
-#'                   leg_title    = NULL,
-#'                   plot_ylim    = NULL,
-#'                   plot_xlim    = NULL,
-#'                   txt_size     = 12) {
-#'   
-#'   if (is.null(xlab)) xlab <- xvar
-#'   if (is.null(ylab)) ylab <- yvar
-#'   
-#'   base_aes <- ggplot2::aes_string(
-#'     x      = xvar,
-#'     y      = yvar,
-#'     colour = colour_by,
-#'     fill   = colour_by
-#'   )
-#'   
-#'   # ── Error display ───────────────────────────────────────────────────────────
-#'   err_mode <- tolower(error)
-#'   ribbon_layer <- NULL
-#'   
-#'   if (err_mode %in% c("full", "y", "yes")) {
-#'     input_df$ymax <- input_df[[yvar]] + input_df$stdev
-#'     input_df$ymin <- input_df[[yvar]] - input_df$stdev
-#'   } else if (err_mode %in% c("half", "0.5")) {
-#'     input_df$ymax <- input_df[[yvar]] + 0.5 * input_df$stdev
-#'     input_df$ymin <- input_df[[yvar]] - 0.5 * input_df$stdev
-#'   }
-#'   
-#'   if (err_mode != "none" && err_mode != "n") {
-#'     err_aes <- ggplot2::aes_string(ymax = "ymax", ymin = "ymin")
-#'     ribbon_layer <- if (tolower(error_type) == "ribbon") {
-#'       ggplot2::geom_ribbon(err_aes, alpha = 0.25, colour = NA)
-#'     } else {
-#'       ggplot2::geom_errorbar(err_aes, alpha = 0.5, colour = "black",
-#'                              width = marker_size/5)
-#'     }
-#'   }
-#'   
-#'   # ── Base plot ───────────────────────────────────────────────────────────────
-#'   plt <- ggplot2::ggplot(input_df, base_aes) +
-#'     ggplot2::theme_bw(base_size = txt_size) +
-#'     ggplot2::theme(
-#'       text              = ggplot2::element_text(size = txt_size),
-#'       legend.position   = leg_loc
-#'     ) +
-#'     ggplot2::xlab(xlab) +
-#'     ggplot2::ylab(ylab) +
-#'     My_Theme(txt_size = txt_size) +
-#'     ggplot2::guides(
-#'       color = ggplot2::guide_legend(override.aes = list(size = 10, pch = 20)),
-#'       fill  = "none"
-#'     )
-#'   
-#'   if (!is.null(ribbon_layer)) plt <- plt + ribbon_layer
-#'   
-#'   # ── Marker ──────────────────────────────────────────────────────────────────
-#'   plt <- plt + if (marker == "line") {
-#'     ggplot2::geom_path(size = marker_size)
-#'   } else {
-#'     ggplot2::geom_point(size = marker_size)
-#'   }
-#'   
-#'   # ── Colours ─────────────────────────────────────────────────────────────────
-#'   if (!is.null(cols)) {
-#'     plt <- plt +
-#'       ggplot2::scale_colour_manual(leg_title, values = cols, drop = TRUE) +
-#'       ggplot2::scale_fill_manual(leg_title, values = cols, drop = TRUE)
-#'   }
-#'   
-#'   # ── Legend title ─────────────────────────────────────────────────────────────
-#'   if (is.null(leg_title)) {
-#'     plt <- plt + ggplot2::theme(legend.title = ggplot2::element_blank())
-#'   }
-#'   
-#'   # ── Facet ───────────────────────────────────────────────────────────────────
-#'   if (!is.null(facet)) {
-#'     plt <- plt + ggplot2::facet_grid(stats::reformulate(facet, "."))
-#'   }
-#'   
-#'   # ── Axis limits (applied before log so limits are in data space) ─────────────
-#'   if (!is.null(plot_xlim)) {
-#'     plt <- plt +
-#'       ggplot2::scale_x_continuous(
-#'         breaks = stefBreaks(plot_xlim)[[1]],
-#'         labels = stefBreaks(plot_xlim)[[2]]
-#'       ) +
-#'       ggplot2::coord_cartesian(xlim = plot_xlim)
-#'   }
-#'   
-#'   if (!is.null(plot_ylim)) {
-#'     plt <- plt +
-#'       ggplot2::scale_y_continuous(
-#'         breaks = stefBreaks(plot_ylim)[[1]],
-#'         labels = stefBreaks(plot_ylim)[[2]]
-#'       ) +
-#'       ggplot2::coord_cartesian(ylim = plot_ylim)
-#'   }
-#'   
-#'   # ── Log axes (override limits above if requested) ────────────────────────────
-#'   log <- tolower(log)
-#'   if (log == "x") plt <- plt + ggplot2::scale_x_log10()
-#'   if (log == "y") plt <- plt + ggplot2::scale_y_log10()
-#'   
-#'   # ── Suppress scientific notation by default ──────────────────────────────────
-#'   if (!isTRUE(sci_notation)) {
-#'     plt <- plt +
-#'       ggplot2::scale_x_continuous(
-#'         labels = function(x) format(x, scientific = FALSE)
-#'       ) +
-#'       ggplot2::scale_y_continuous(
-#'         labels = function(y) format(y, scientific = FALSE)
-#'       )
-#'   }
-#'   
-#'   return(plt)
-#' }
-
 #' General-purpose xy scatter / line plot
 #'
 #' Builds a ggplot2 line or point plot from a data frame. Supports error
 #' ribbons or bars, manual colours, faceting, log axes, and axis limits.
 #'
-#' @param input_df    data.frame  Must contain columns named by `xvar` and
-#'                     `yvar`. For error display it also needs a `stdev` column.
-#' @param xvar        character  Column name for the x axis (default: "x").
-#' @param yvar        character  Column name for the y axis (default: "y").
-#' @param xlab        character/NULL  X axis label. NULL defaults to `xvar`.
-#' @param ylab        character/NULL  Y axis label. NULL defaults to `yvar`.
-#' @param colour_by   character  Column used for colour/fill grouping
-#'                     (default: "id").
-#' @param leg_loc     character  Legend position: "right", "left", "top",
-#'                     "bottom", or "none" (default: "right").
-#' @param error       character  Error display: "full" → full ±SD,
-#'                     "half" → ±0.5 SD, "none" → no error (default: "none").
-#' @param error_type  character  "ribbon" (default) or "errorbar".
-#' @param cols        character/NULL  Manual colour values (recycled if short).
-#' @param facet       character/NULL  Column name to facet by (rows ~ facet).
-#' @param marker      character  "line" (default) or "point".
-#' @param marker_size numeric  Geom size (default: 1).
-#' @param n_ticks     integer  Approximate number of x-axis breaks (default: 10).
-#' @param log         character  Log-scale axes: "x", "y", or "none" (default).
-#' @param sci_notation logical  TRUE enables scientific notation on axes
-#'                     (default: FALSE — plain number format).
-#' @param leg_title   character/NULL  Legend title. NULL removes the title.
-#' @param plot_ylim   numeric/NULL  Y axis limits c(min, max).
-#' @param plot_xlim   numeric/NULL  X axis limits c(min, max).
-#' @param txt_size    numeric  Base font size passed to My_Theme (default: 12).
+#' @param input_df    data.frame containing columns named by xvar and yvar.
+#' @param xvar        Character. X-axis column (default: "x").
+#' @param yvar        Character. Y-axis column (default: "y").
+#' @param xlab        Character/NULL. X-axis label; defaults to xvar.
+#' @param ylab        Character/NULL. Y-axis label; defaults to yvar.
+#' @param colour_by   Character/NULL. Column used for colour/fill grouping.
+#'                    NULL plots everything in a single colour.
+#' @param leg_loc     Character. Legend position (default: "right").
+#' @param error       Logical or character. TRUE/"full" enables full SD;
+#'                    "half" enables half SD; FALSE/"none" disables errors.
+#'                    Also accepts "y"/"yes" and "n"/"no".
+#' @param error_type  Character. "ribbon" (default) or "errorbar".
+#' @param cols        Character/NULL. Manual colour values.
+#' @param facet       Character/NULL. Column name to facet by (rows ~ facet).
+#' @param marker      Character. "line" (default) or "point".
+#' @param marker_size Numeric. Geom size (default: 1).
+#' @param n_ticks     Integer. Approximate number of x-axis breaks.
+#' @param log         Character. Log-scale axis: "x", "y", or "none".
+#' @param sci_notation Logical. TRUE enables scientific axis notation.
+#' @param leg_title   Character/NULL. Legend title; NULL removes the title.
+#' @param plot_ylim   Numeric/NULL. Y-axis limits c(min, max).
+#' @param plot_xlim   Numeric/NULL. X-axis limits c(min, max).
+#' @param txt_size    Numeric. Base font size (default: 12).
 #'
 #' @return ggplot2 object.
 plotr <- function(input_df,
@@ -817,7 +866,7 @@ plotr <- function(input_df,
                   ylab         = NULL,
                   colour_by    = "id",
                   leg_loc      = "right",
-                  error        = "none",
+                  error        = FALSE,
                   error_type   = "ribbon",
                   cols         = NULL,
                   facet        = NULL,
@@ -831,40 +880,116 @@ plotr <- function(input_df,
                   plot_xlim    = NULL,
                   txt_size     = 12) {
   
+  # ── Basic validation ──────────────────────────────────────────────────────
+  
+  if (!is.data.frame(input_df)) {
+    stop("input_df must be a data.frame.")
+  }
+  
+  if (!all(c(xvar, yvar) %in% names(input_df))) {
+    stop("input_df must contain columns named '", xvar, "' and '", yvar, "'.")
+  }
+  
+  if (!is.null(colour_by) && !colour_by %in% names(input_df)) {
+    stop("colour_by column '", colour_by, "' not found in input_df.")
+  }
+  
+  if (!is.null(facet) && !facet %in% names(input_df)) {
+    stop("facet column '", facet, "' not found in input_df.")
+  }
+  
   if (is.null(xlab)) xlab <- xvar
   if (is.null(ylab)) ylab <- yvar
   
-  base_aes <- ggplot2::aes_string(
-    x      = xvar,
-    y      = yvar,
-    colour = colour_by,
-    fill   = colour_by
-  )
+  marker <- tolower(marker)
+  error_type <- tolower(error_type)
+  log <- tolower(log)
   
-  # ── Error display ───────────────────────────────────────────────────────────
-  err_mode <- tolower(error)
-  ribbon_layer <- NULL
-  
-  if (err_mode %in% c("full", "y", "yes")) {
-    input_df$ymax <- input_df[[yvar]] + input_df$stdev
-    input_df$ymin <- input_df[[yvar]] - input_df$stdev
-  } else if (err_mode %in% c("half", "0.5")) {
-    input_df$ymax <- input_df[[yvar]] + 0.5 * input_df$stdev
-    input_df$ymin <- input_df[[yvar]] - 0.5 * input_df$stdev
+  if (!marker %in% c("line", "point")) {
+    stop("marker must be 'line' or 'point'.")
   }
   
-  if (err_mode != "none" && err_mode != "n") {
-    err_aes <- ggplot2::aes_string(ymax = "ymax", ymin = "ymin")
-    ribbon_layer <- if (tolower(error_type) == "ribbon") {
-      ggplot2::geom_ribbon(err_aes, alpha = 0.25, colour = NA)
-    } else {
-      ggplot2::geom_errorbar(err_aes, alpha = 0.5, colour = "black",
-                             width = marker_size / 5)
+  if (!error_type %in% c("ribbon", "errorbar")) {
+    stop("error_type must be 'ribbon' or 'errorbar'.")
+  }
+  
+  if (!log %in% c("x", "y", "none")) {
+    stop("log must be 'x', 'y', or 'none'.")
+  }
+  
+  if (!is.logical(sci_notation) ||
+      length(sci_notation) != 1L ||
+      is.na(sci_notation)) {
+    stop("sci_notation must be TRUE or FALSE.")
+  }
+  
+  # ── Interpret error setting ───────────────────────────────────────────────
+  
+  if (is.logical(error) && length(error) == 1L && !is.na(error)) {
+    
+    err_mode <- if (error) "full" else "none"
+    
+  } else if (is.character(error) && length(error) == 1L &&
+             !is.na(error)) {
+    
+    err_mode <- tolower(error)
+    
+    # Backwards-compatible aliases
+    if (err_mode %in% c("y", "yes", "true")) {
+      err_mode <- "full"
     }
+    
+    if (err_mode %in% c("n", "no", "false")) {
+      err_mode <- "none"
+    }
+    
+  } else {
+    stop("error must be TRUE/FALSE or a valid character option.")
   }
   
-  # ── Base plot ───────────────────────────────────────────────────────────────
-  plt <- ggplot2::ggplot(input_df, base_aes) +
+  if (!err_mode %in% c("full", "half", "none")) {
+    stop("error must be TRUE, FALSE, 'full', 'half', or 'none'.")
+  }
+  
+  # ── Error data ────────────────────────────────────────────────────────────
+  
+  # Work on a local copy; don't modify the original data frame.
+  plot_df <- input_df
+  
+  if (err_mode != "none") {
+    
+    if (!"stdev" %in% names(plot_df)) {
+      stop("An 'stdev' column is required when error is enabled.")
+    }
+    
+    err_factor <- if (err_mode == "half") 0.5 else 1
+    
+    plot_df$ymax <- plot_df[[yvar]] + err_factor * plot_df$stdev
+    plot_df$ymin <- plot_df[[yvar]] - err_factor * plot_df$stdev
+  }
+  
+
+  # ── Base aesthetics ──────────────────────────────────────────────────────
+  
+  base_aes <- if (is.null(colour_by)) {
+    
+    ggplot2::aes(
+      x = .data[[xvar]],
+      y = .data[[yvar]]
+    )
+    
+  } else {
+    
+    ggplot2::aes(
+      x      = .data[[xvar]],
+      y      = .data[[yvar]],
+      colour = .data[[colour_by]],
+      fill   = .data[[colour_by]]
+    )
+  }
+  # ── Base plot ─────────────────────────────────────────────────────────────
+  
+  plt <- ggplot2::ggplot(plot_df, base_aes) +
     ggplot2::theme_bw(base_size = txt_size) +
     ggplot2::theme(
       text            = ggplot2::element_text(size = txt_size),
@@ -872,69 +997,151 @@ plotr <- function(input_df,
     ) +
     ggplot2::xlab(xlab) +
     ggplot2::ylab(ylab) +
-    My_Theme(txt_size = txt_size) +
-    ggplot2::guides(
-      color = ggplot2::guide_legend(override.aes = list(size = 10, pch = 20)),
-      fill  = "none"
+    My_Theme(txt_size = txt_size)
+  
+  # ── Error display ─────────────────────────────────────────────────────────
+  
+  if (err_mode != "none") {
+    
+    err_aes <- ggplot2::aes_string(
+      ymin = "ymin",
+      ymax = "ymax"
     )
-  
-  if (!is.null(ribbon_layer)) plt <- plt + ribbon_layer
-  
-  # ── Marker ──────────────────────────────────────────────────────────────────
-  plt <- plt + if (marker == "line") {
-    ggplot2::geom_path(size = marker_size)
-  } else {
-    ggplot2::geom_point(size = marker_size)
-  }
-  
-  # ── Colours ─────────────────────────────────────────────────────────────────
-  if (!is.null(cols)) {
-    plt <- plt +
-      ggplot2::scale_colour_manual(leg_title, values = cols, drop = TRUE) +
-      ggplot2::scale_fill_manual(leg_title, values = cols, drop = TRUE)
-  }
-  
-  # ── Legend title ────────────────────────────────────────────────────────────
-  if (is.null(leg_title)) {
-    plt <- plt + ggplot2::theme(legend.title = ggplot2::element_blank())
-  }
-  
-  # ── Facet ───────────────────────────────────────────────────────────────────
-  if (!is.null(facet)) {
-    plt <- plt + ggplot2::facet_grid(stats::reformulate(facet, "."))
-  }
-  
-  # ── Axis scales (limits, log, sci notation — built once per axis) ───────────
-  make_scale <- function(axis, is_log, lims, use_sci) {
-    scale_fn <- if (is_log) {
-      if (axis == "x") ggplot2::scale_x_log10 else ggplot2::scale_y_log10
+    
+    if (error_type == "ribbon") {
+      
+      plt <- plt +
+        ggplot2::geom_ribbon(
+          mapping = err_aes,
+          alpha   = 0.25,
+          colour  = NA
+        )
+      
     } else {
-      if (axis == "x") ggplot2::scale_x_continuous else ggplot2::scale_y_continuous
+      
+      plt <- plt +
+        ggplot2::geom_errorbar(
+          mapping = err_aes,
+          alpha   = 0.5,
+          colour  = "black",
+          width   = marker_size / 5
+        )
+    }
+  }
+  
+  # ── Marker ────────────────────────────────────────────────────────────────
+  
+  if (marker == "line") {
+    
+    plt <- plt +
+      ggplot2::geom_path(size = marker_size)
+    
+  } else {
+    
+    plt <- plt +
+      ggplot2::geom_point(size = marker_size)
+  }
+  
+  # ── Colours ───────────────────────────────────────────────────────────────
+  
+  if (!is.null(cols) && !is.null(colour_by)) {
+    
+    plt <- plt +
+      ggplot2::scale_colour_manual(
+        name   = leg_title,
+        values = cols,
+        drop   = TRUE
+      ) +
+      ggplot2::scale_fill_manual(
+        name   = leg_title,
+        values = cols,
+        drop   = TRUE
+      )
+  }
+  
+  # ── Legend ────────────────────────────────────────────────────────────────
+  
+  if (!is.null(colour_by)) {
+    
+    plt <- plt +
+      ggplot2::guides(
+        colour = ggplot2::guide_legend(
+          override.aes = list(size = 10, shape = 20)
+        ),
+        fill = "none"
+      )
+    
+    if (is.null(leg_title)) {
+      plt <- plt +
+        ggplot2::theme(legend.title = ggplot2::element_blank())
+    }
+  }
+  
+  # ── Facet ─────────────────────────────────────────────────────────────────
+  
+  if (!is.null(facet)) {
+    plt <- plt +
+      ggplot2::facet_grid(stats::reformulate(facet, "."))
+  }
+  
+  # ── Axis scales ───────────────────────────────────────────────────────────
+  
+  make_scale <- function(axis, is_log, lims, use_sci) {
+    
+    scale_fn <- if (is_log) {
+      
+      if (axis == "x") {
+        ggplot2::scale_x_log10
+      } else {
+        ggplot2::scale_y_log10
+      }
+      
+    } else {
+      
+      if (axis == "x") {
+        ggplot2::scale_x_continuous
+      } else {
+        ggplot2::scale_y_continuous
+      }
     }
     
     args <- list()
     
     if (!is_log && !is.null(lims)) {
-      sb           <- stefBreaks(lims)
-      args$breaks  <- sb[[1]]
-      args$labels  <- sb[[2]]
+      
+      sb <- stefBreaks(lims)
+      
+      args$breaks <- sb[[1]]
+      args$labels <- sb[[2]]
+      
     } else if (!use_sci) {
-      args$labels <- function(v) format(v, scientific = FALSE)
+      
+      args$labels <- function(v) {
+        format(v, scientific = FALSE, trim = TRUE)
+      }
     }
     
     do.call(scale_fn, args)
   }
   
-  log <- tolower(log)
   plt <- plt +
-    make_scale("x", log == "x", plot_xlim, isTRUE(sci_notation)) +
-    make_scale("y", log == "y", plot_ylim, isTRUE(sci_notation))
+    make_scale("x", log == "x", plot_xlim, sci_notation) +
+    make_scale("y", log == "y", plot_ylim, sci_notation)
   
-  if (!is.null(plot_xlim)) plt <- plt + ggplot2::coord_cartesian(xlim = plot_xlim)
-  if (!is.null(plot_ylim)) plt <- plt + ggplot2::coord_cartesian(ylim = plot_ylim)
+  # ── Axis limits ───────────────────────────────────────────────────────────
+  
+  if (!is.null(plot_xlim) || !is.null(plot_ylim)) {
+    
+    plt <- plt +
+      ggplot2::coord_cartesian(
+        xlim = plot_xlim,
+        ylim = plot_ylim
+      )
+  }
   
   return(plt)
 }
+
 
 #' Bar chart with optional error bars and value labels
 #'
@@ -987,8 +1194,6 @@ barPlotr <- function(input_df,
       fill   = .data[[colour_col]]
     )
   )
-  
-  #pd2 <- ggplot2::position_dodge2(width = 0.9, preserve = "single")
   pd <- ggplot2::position_dodge(width = 0.9, preserve = "single")
   
   
@@ -1123,18 +1328,47 @@ derivative1 <- function(x, y) {
 #'
 #' @examples
 #' peaks <- peakID(my_spectrum, smooth = 5, min_prominence = 0.05)
-peakID <- function(y, smooth = 0, min_prominence = 0.01) {
+#' 
+
+#' Detect local maxima in a numeric vector
+#'
+#' Identifies peaks by locating sign changes in the first difference.
+#' Optional smoothing reduces noise sensitivity, and a prominence threshold
+#' filters out weak peaks.
+#'
+#' @param y               numeric Input signal vector.
+#' @param x               numeric Optional x-coordinates. If supplied, data
+#'                          are sorted by x before peak detection.
+#' @param smooth          integer Moving-average window width. 0 = no smoothing.
+#' @param min_prominence  numeric Minimum peak height relative to the global
+#'                          signal range, on a [0, 1] scale.
+#'
+#' @return Data frame with columns: index, x, value, smoothed_value, prominence.
+#'   Returns NULL if no peaks pass the threshold.
+# install.packages("pracma") # if needed
+
+peakID <- function(y, x = NULL, smooth = 0,
+                   min_prominence = 0.01) {
   
-  # Optional moving-average smoothing
+  if (!is.null(x)) {
+    if (length(x) != length(y)) {
+      stop("x and y must have the same length.")
+    }
+    
+    ord <- order(x)
+    x <- x[ord]
+    y <- y[ord]
+  }
+  
   if (smooth > 1) {
     kernel <- rep(1 / smooth, smooth)
-    y_s    <- as.numeric(stats::filter(y, kernel, sides = 2))
-    y_s[is.na(y_s)] <- y[is.na(y_s)]   # preserve edge values
+    y_s <- as.numeric(stats::filter(y, kernel, sides = 2))
+    y_s[is.na(y_s)] <- y[is.na(y_s)]
   } else {
     y_s <- y
   }
   
-  # Local maxima: positions where second difference changes sign from + to -
+  # Detect local maxima
   peak_idx <- which(diff(sign(diff(y_s))) == -2) + 1
   
   if (length(peak_idx) == 0) {
@@ -1142,21 +1376,46 @@ peakID <- function(y, smooth = 0, min_prominence = 0.01) {
     return(NULL)
   }
   
-  # Normalised prominence: height above the global minimum
-  prom      <- (y_s[peak_idx] - min(y_s)) / (max(y_s) - min(y_s))
-  keep_idx  <- peak_idx[prom >= min_prominence]
+  # Calculate local prominence for each peak
+  prom <- vapply(peak_idx, function(i) {
+    left <- i - 1
+    while (left > 1 && y_s[left - 1] < y_s[i]) {
+      left <- left - 1
+    }
+    
+    right <- i + 1
+    while (right < length(y_s) && y_s[right + 1] < y_s[i]) {
+      right <- right + 1
+    }
+    
+    min(y_s[i] - min(y_s[left:i]),
+        y_s[i] - min(y_s[i:right]))
+  }, numeric(1))
   
-  if (length(keep_idx) == 0) {
-    warning("peakID: no peaks exceed prominence threshold (", min_prominence, ").")
-    return(NULL)
+  # Normalise prominence to global signal range
+  signal_range <- diff(range(y_s))
+  
+  if (signal_range == 0) return(NULL)
+  
+  prom_norm <- prom / signal_range
+  keep <- prom_norm >= min_prominence
+  
+  if (!any(keep)) return(NULL)
+  
+  result <- data.frame(
+    index = peak_idx[keep],
+    value = y[peak_idx[keep]],
+    smoothed_value = y_s[peak_idx[keep]],
+    prominence = prom_norm[keep]
+  )
+  
+  if (!is.null(x)) {
+    result$x <- x[peak_idx[keep]]
+    result <- result[, c("index", "x", "value",
+                         "smoothed_value", "prominence")]
   }
   
-  data.frame(
-    index          = keep_idx,
-    value          = y[keep_idx],
-    smoothed_value = y_s[keep_idx],
-    prominence     = prom[prom >= min_prominence]
-  )
+  result
 }
 
 
@@ -1241,31 +1500,7 @@ peakValue <- function(x, y, peak_idx, window = 3, show_plot = TRUE,
 }
 
 
-#' Find local maxima using second-difference sign change (legacy helper)
-#'
-#' Credit: Stasia Grinberg. For valley detection, pass `-y`.
-#'
-#' @param x  numeric  Signal vector.
-#' @param m  integer  Sensitivity — larger values detect fewer, broader peaks
-#'                     (default: 3).
-#'
-#' @return integer vector of peak indices.
-find_peaks <- function(x, m = 3) {
-  shape <- diff(sign(diff(x, na.pad = FALSE)))
-  pks   <- sapply(which(shape < 0), function(i) {
-    lo <- max(1, i - m + 1)
-    hi <- min(length(x), i + m + 1)
-    if (all(x[c(lo:i, (i + 2):hi)] <= x[i + 1])) i + 1 else numeric(0)
-  })
-  unlist(pks)
-}
-
-
 #' Compute the area under each peak in an xy signal
-#'
-#' Locates peaks with find_peaks, finds each peak's left and right minima,
-#' and integrates using the trapezoidal rule. Optionally operates in log10(x)
-#' space for size distributions.
 #'
 #' @param x         numeric  x-axis values (must be sorted or will be sorted).
 #' @param y         numeric  y-axis values.
@@ -1469,92 +1704,136 @@ fitr <- function(input_df,
   return(out)
 }
 
-# ── Section 7: Efflux / Flux Data ────────────────────────────────────────────
 
 #' Prepare cuvette efflux data for plotting
 #'
-#' Removes pre-injection data, resets time to zero, normalises, and then
-#' averages replicates identified by the `sample` column. Handles the ".1",
-#' ".2" suffixes that some fluorimeters append to repeated sample names.
+#' Removes pre-injection data, resets time to zero, normalises each
+#' replicate, aligns replicates to a common time grid, and averages.
 #'
-#' @param input_df    data.frame  Output of cuvette_framer / cuvette_importer.
-#'                     Requires columns: x (time), y (signal), sample, id.
-#' @param inject_list numeric vector  Injection time(s) in the same units as x.
-#'                     If fewer times than samples are given, the list is
-#'                     recycled.
-#' @param normalise   character  Normalisation applied after time-zeroing:
-#'                     "yes"/"y" → 0-1 × 100, "zero"/"0" → subtract first
-#'                     value, "min" → subtract minimum (default: "yes").
-#' @param time_round  integer  Decimal places to round x to before aggregating
-#'                     replicates — reduce if traces are noisy (default: 1).
+#' @param input_df    Data frame containing x, y, sample, and id.
+#' @param inject_list Injection times, recycled across replicates if needed.
+#' @param normalise   "yes"/"y", "zero"/"0", "min", or "none".
+#' @param time_round  Decimal places for the common time grid.
 #'
-#' @return data.frame with columns: id (sample name), x (time), y (mean),
-#'   stdev.
+#' @return Data frame with columns id, x, y, stdev.
+
 effluxDataPrep <- function(input_df,
                            inject_list,
-                           normalise  = "yes",
+                           normalise = "yes",
                            time_round = 1) {
   
-  samples   <- unique(input_df$sample)
-  n_samp    <- length(samples)
-  n_inj     <- length(inject_list)
+  # Injection time mapping: source file ID -> injection time
+  source_ids <- unique(as.character(input_df$id))
   
-  message("effluxDataPrep: processing ", n_samp, " sample(s): ",
-          paste(samples, collapse = ", "))
-  message("  Injection times: ", paste(inject_list, collapse = ", "))
-  
-  # Recycle injection times if fewer than sample count
-  if (n_samp > n_inj) {
-    inject_list <- rep(inject_list, length.out = n_samp)
-    message("  Recycled injection times to match ", n_samp, " samples.")
+  if (length(inject_list) != length(source_ids)) {
+    stop(
+      "Supply one injection time per source file ID. IDs are: ",
+      paste(source_ids, collapse = ", ")
+    )
   }
   
-  # Unique split key: sample + file id to handle same sample name across files
-  input_df$split_key <- paste0(input_df$sample, input_df$id)
+  injection_map <- setNames(inject_list, source_ids)
   
-  working_df <- do.call(rbind, mapply(
-    function(sub_df, t_inject) {
-      sub_df  <- subset(sub_df, sub_df$x > t_inject)
-      sub_df$x <- sub_df$x - sub_df$x[1]
-      sub_df$x <- round(sub_df$x, time_round)
+  # Remove only fluorimeter replicate suffixes
+  input_df$condition <- sub(
+    "\\.[0-9]+$", "", as.character(input_df$sample)
+  )
+  
+  # Keep original recording name to distinguish replicates
+  input_df$recording <- as.character(input_df$sample)
+  
+  groups <- split(input_df, input_df$recording)
+  
+  prepared <- lapply(groups, function(d) {
+    
+    t_inject <- injection_map[as.character(d$id[1])]
+    
+    d <- d[order(d$x), ]
+    d <- d[d$x > t_inject, ]
+    
+    if (nrow(d) < 2) return(NULL)
+    
+    # Reset time independently for each recording
+    d$x <- d$x - d$x[1]
+    
+    # Normalise each recording independently
+    nrm <- tolower(normalise)
+    
+    if (nrm %in% c("yes", "y")) {
+      yrange <- diff(range(d$y, na.rm = TRUE))
+      if (!is.finite(yrange) || yrange == 0) return(NULL)
       
-      nrm <- tolower(normalise)
-      if (nrm %in% c("y", "yes")) {
-        sub_df$y <- norm(sub_df$y) * 100
-      } else if (nrm %in% c("0", "zero")) {
-        sub_df$y <- sub_df$y - sub_df$y[1]
-      } else if (nrm == "min") {
-        sub_df$y <- sub_df$y - min(sub_df$y, na.rm = TRUE)
-      }
+      d$y <- (d$y - min(d$y, na.rm = TRUE)) / yrange * 100
       
-      sub_df
-    },
-    split(input_df, input_df$split_key),
-    inject_list,
-    SIMPLIFY = FALSE
-  ))
+    } else if (nrm %in% c("zero", "0")) {
+      d$y <- d$y - d$y[1]
+      
+    } else if (nrm == "min") {
+      d$y <- d$y - min(d$y, na.rm = TRUE)
+    }
+    
+    d <- d[is.finite(d$x) & is.finite(d$y), ]
+    
+    # Handle duplicate times within a recording
+    d <- aggregate(y ~ x, data = d, FUN = mean)
+    
+    d$recording <- as.character(groups[[1]]$recording[1])
+    d
+  })
   
-  # Strip fluorimeter-added numeric suffixes (e.g. "Sample.1" → "Sample")
-  cleaned_names <- unique(sub("\\.[0-9]+$", "", unique(working_df$sample)))
-  message("effluxDataPrep: cleaned sample names: ",
-          paste(cleaned_names, collapse = ", "))
+  # Rebuild recording metadata robustly
+  prepared <- Filter(Negate(is.null), prepared)
   
-  working_df$sample <- sub("\\.[0-9]+$", "", working_df$sample)
+  if (!length(prepared)) stop("No valid recordings after injection.")
   
-  # Average replicates per sample × time using modal average + SD
-  out_df <- stats::aggregate(y ~ sample + x, data = working_df,
-                             function(vals) c(avg = modalAvg(vals), sd = sd(vals)))
-  out_df <- do.call(data.frame, out_df)
-  names(out_df) <- c("id", "x", "y", "stdev")
+  # Assign condition from the recording name
+  for (i in seq_along(prepared)) {
+    prepared[[i]]$recording <- names(prepared)[i]
+    prepared[[i]]$condition <- sub(
+      "\\.[0-9]+$", "", names(prepared)[i]
+    )
+  }
   
-  message("effluxDataPrep: done — ", nrow(out_df), " rows returned")
-  return(out_df)
+  # Common grid across recordings, in the same time units as x
+  dt <- 1 / (10^time_round)
+  max_time <- max(vapply(prepared, function(d) max(d$x), numeric(1)))
+  grid <- seq(0, floor(max_time / dt) * dt, by = dt)
+  
+  # Interpolate within each recording's measured range
+  aligned <- do.call(rbind, lapply(prepared, function(d) {
+    
+    grid_use <- grid[
+      grid >= min(d$x) & grid <= max(d$x)
+    ]
+    
+    data.frame(
+      condition = d$condition[1],
+      recording = d$recording[1],
+      x = grid_use,
+      y = approx(d$x, d$y, xout = grid_use, ties = mean)$y
+    )
+  }))
+  
+  # Average across recordings in each condition
+  out <- aggregate(
+    y ~ condition + x,
+    data = aligned,
+    FUN = function(v) c(
+      mean = mean(v),
+      sd = if (length(v) > 1) sd(v) else NA_real_,
+      n = length(v)
+    )
+  )
+  
+  out <- do.call(data.frame, out)
+  names(out) <- c("id", "x", "y", "stdev", "n")
+  
+  out
 }
-
 
 #' Background-corrected maximum efflux values for pairwise sample/background
 #'
-#' Extracts maximum y values up to `t_max` for four groups (bkg1, sample1,
+#' Extracts maximum y values up to t_max` for four groups (bkg1, sample1,
 #' bkg2, sample2) and returns background-subtracted values with propagated SD.
 #'
 #' @param input_df  data.frame  Output of effluxDataPrep. Requires: x, y,
@@ -1727,7 +2006,7 @@ DNAQuant <- function(input_df,
   SS_FACTOR <- 33   # µg/mL per A260 unit for ssDNA
   
   # Load DIBMA reference spectrum for A260 subtraction
-  dib_path  <- "/media/jonah/Lickitung/SYNC/8-LAB_DATA/UV-VIS/SCANS/20220407_New_ND_Quant/"
+  dib_path  <- "~/Onedrive/Lab_Data/UV-VIS/SCANS/20220407_New_ND_Quant/"
   dib_raw   <- xy_data_importr("dibma_1in20.csv", dib_path, ext = "",
                                normalise = "zero")
   dib_uM    <- as.numeric(polQuant(dib_raw, dil_facs = 20)[5])
