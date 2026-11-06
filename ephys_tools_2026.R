@@ -3,19 +3,11 @@
 # =============================================================================
 # Functions for importing, processing, and visualising current recordings
 # from Oxford Nanopore (FAST5/HDF5) and OrbitMini (.abf) devices.
-#
-# Conventions used throughout:
-#   - Data frames passed as the first argument are always named `input_df`
-#   - Boolean-like parameters use TRUE/FALSE or NULL (not "y"/"n" strings)
-#   - File paths are constructed with file.path() throughout
-#   - message() is used for progress reporting; warning() for recoverable issues
-# =============================================================================
-
 # -------------- Dependencies ----------------------------#
 ## install packages if required
 pkgs <- c("rhdf5","rhdf5filters","Rhdf5lib", "cowplot", "ggpubr", "scales", "signal","readABF",
           "data.table", "zoo", "docstring", "readABF", "asdetect","fitdistrplus", "scattermore", 
-          "svglite", "parallel", "MASS", "future.apply" )
+          "svglite", "parallel", "MASS", "future.apply", "stats" )
 
 not_installed <- pkgs[!(pkgs %in% installed.packages()[ , "Package"])]
 if(length(not_installed)) install.packages(not_installed)
@@ -30,7 +22,6 @@ lapply(pkgs, require, character.only=TRUE)
 
 ## Below should not be necessary as should be self-reliant now 
 # needed for myTheme in plotting functions
-#source("~/Onedrive/Scripts/R/jlc_lab_tools.R")
 source("~/Onedrive/Scripts/R/LabTools_2026.R")
 
 
@@ -536,46 +527,43 @@ runReporter <- function(direc,
 #' subtracts it. A secondary check using a modal average over the mid-trace
 #' region catches cases where the initial estimate fails.
 #'
-#' @param input_df    data.table  Requires columns: current, time, voltage.
-#' @param method      character  "robust" (default) uses openPoreCalc on the
-#'                     initial segment; "min" subtracts the minimum value.
-#' @param ...         Forwarded to openPoreCalc.
-#'
-#' @return data.table with the current column offset-corrected in place.
-offsetCorrect <- function(input_df, method = c("robust", "min"), ...) {
+offsetCorrect <- function(input_df) {
   
-  method <- match.arg(method)
   data.table::setDT(input_df)
-  input_df[, rel_time := time - time[1]]
   
-  init_cur <- initSelector(input_df)
+  # Find the 0 mV step
+  zero_step <- input_df[voltage == 0]
   
-  if (method == "robust") {
-    offset <- tryCatch(
-      as.numeric(openPoreCalc(init_cur, ...)),
-      error = function(e) NA_real_
-    )
-    
-    if (!is.na(offset) && abs(offset) >= 0.005) {
-      input_df[, current := current - offset]
-      message("  offsetCorrect: primary offset = ", round(offset, 4))
-    }
-    
-    # Secondary check over the 20–65 % time window
-    offset_check <- modalAvg(
-      input_df[rel_time > max(rel_time) * 0.2 &
-                 rel_time < max(rel_time) * 0.65, current]
-    )
-    if (!is.na(offset_check) && abs(offset_check) > 0.05) {
-      input_df[, current := current - offset_check]
-      message("  offsetCorrect: secondary offset = ", round(offset_check, 4))
-    }
-    
-  } else {
-    offset <- min(init_cur, na.rm = TRUE)
-    input_df[, current := current - offset]
-    message("  offsetCorrect: min offset = ", round(offset, 4))
+  if (nrow(zero_step) == 0L) {
+    warning("offsetCorrect: no 0 mV step found; data unchanged")
+    return(input_df)
   }
+  
+  # Remove the first and last 10% of the step
+  n <- nrow(zero_step)
+  start <- floor(n * 0.1) + 1L
+  end   <- ceiling(n * 0.9)
+  
+  zero_step <- zero_step[start:end]
+  
+  if (nrow(zero_step) == 0L) {
+    warning("offsetCorrect: insufficient data in 0 mV step; data unchanged")
+    return(input_df)
+  }
+  
+  # Estimate offset from the minimum remaining current
+  offset <- min(zero_step$current, na.rm = TRUE)
+  
+  if (!is.finite(offset)) {
+    warning("offsetCorrect: could not estimate offset; data unchanged")
+    return(input_df)
+  }
+  
+  # Shift the entire dataset so the minimum current at 0 mV is zero
+  input_df[, current := current - offset]
+  
+  message("  offsetCorrect: 0 mV minimum = ", round(offset, 4), " pA")
+  message("  offsetCorrect: applied offset = ", round(offset, 4), " pA")
   
   return(input_df)
 }
@@ -623,41 +611,74 @@ opcFinder <- function(input_df, sd_adjust = 1, ...) {
 
 #' Estimate the open-pore current from a current vector
 #'
-#' Trims transient edges, focuses on the upper quantile range (where the open
-#' pore signal lives), and fits a robust linear intercept. Falls back to the
-#' median if the robust fit fails.
+#' Splits the trace into blocks, takes the density mode of each block (the
+#' open-pore level, since the open pore is where the trace spends most of its
+#' time), discards blocks sitting on a long blockade, and combines the rest.
+#' Polarity is detected automatically, so negative voltages work, and the
+#' result is returned in the same sign/units as the input.
 #'
-#' @param current_values  numeric  Current samples for one voltage step.
-#' @param ...             Reserved; ignored.
-#'
-#' @return numeric scalar: estimated open-pore current.
-openPoreCalc <- function(current_values, ...) {
+#' @param current_values numeric  Current samples for one voltage step.
+#' @param local   logical  FALSE (default): return one scalar. TRUE: return a
+#'                  baseline vector, same length as input, interpolated
+#'                  between block centres (follows drift).
+#' @param zero    numeric  Zero-current offset (e.g. median current at 0 mV).
+#' @param block_n integer  Samples per block (default 2000 = 0.5 s at 4 kHz).
+#' @param min_frac numeric Blocks whose mode is below min_frac * (75th
+#'                  percentile of block modes) are treated as blockades.
+#' @param ...     Reserved; ignored.
+openPoreCalc <- function(current_values,
+                         local    = FALSE,
+                         zero     = 0,
+                         block_n  = 2000L,
+                         min_frac = 0.75,
+                         ...) {
   
-  current_values <- current_values[is.finite(current_values)]
+  n   <- length(current_values)
+  fin <- is.finite(current_values)
+  out <- function(v) if (local) rep(v, n) else v
   
-  if (length(current_values) < 10)
-    return(stats::median(current_values, na.rm = TRUE))
+  if (sum(fin) < 100)
+    return(out(stats::median(current_values, na.rm = TRUE)))
   
-  n       <- length(current_values)
-  trimmed <- current_values[seq.int(n * 0.25, n * 0.9)]
+  # Normalise: subtract zero offset, flip so the open pore is positive
+  pol <- sign(stats::median(current_values[fin] - zero))
+  if (pol == 0) pol <- 1
+  x <- (current_values - zero) * pol
   
-  if (length(trimmed) < 10)
-    return(stats::median(current_values, na.rm = TRUE))
+  # Block-wise density mode
+  grp     <- (seq_len(n) - 1L) %/% as.integer(block_n)
+  idx     <- split(seq_len(n), grp)
+  centres <- vapply(idx, mean, numeric(1))
+  base    <- vapply(idx, function(i) {
+    v <- x[i]; v <- v[is.finite(v)]
+    if (length(v) < 100) return(NA_real_)
+    d <- stats::density(v, n = 512)
+    d$x[which.max(d$y)]
+  }, numeric(1))
   
-  lower    <- stats::quantile(trimmed, 0.60, names = FALSE)
-  upper    <- stats::quantile(trimmed, 0.95, names = FALSE)
-  filtered <- trimmed[trimmed > lower & trimmed <= upper]
+  if (all(is.na(base)))
+    return(out(stats::median(current_values, na.rm = TRUE)))
   
-  if (length(filtered) < 10)
-    return(stats::median(trimmed, na.rm = TRUE))
+  # Reject blocks that have collapsed onto a blockade
+  ref <- stats::quantile(base, 0.75, na.rm = TRUE, names = FALSE)
+  low <- unname(!is.na(base) & base < min_frac * ref)   # rejected for a low mode (not for too few samples)
+  base[low] <- NA_real_
+  ok  <- !is.na(base)
   
-  result <- tryCatch(
-    suppressMessages(stats::coef(MASS::rlm(filtered ~ 1, method = "MM"))[1]),
-    error = function(e) stats::median(filtered, na.rm = TRUE)
-  )
+  if (!local) return(as.numeric(stats::median(base[ok]) * pol + zero))
   
-  as.numeric(result)
+  b <- if (sum(ok) >= 2) {
+    stats::approx(centres[ok], base[ok], xout = seq_len(n), rule = 2)$y
+  } else {
+    rep(base[ok][1], n)
+  }
+  b <- b * pol + zero
+  attr(b, "rejected") <- low[grp + 1L]   # per-sample flag: TRUE where the block was rejected
+  b
 }
+
+
+
 
 
 #' Apply a Butterworth low-pass filter to a current trace
@@ -679,8 +700,8 @@ openPoreCalc <- function(current_values, ...) {
 besselFilt <- function(input_df,
                        sample_rate   = NULL,
                        data_path     = NULL,
-                       filter_order  = 4,
-                       filter_cutoff = 10000,
+                       filter_order  = 2,
+                       filter_cutoff = 1000,
                        filter_type   = c("low", "high", "stop", "pass"),
                        ...) {
   
@@ -1148,7 +1169,7 @@ runReadr <- function(direc,
 #'
 #' For each file, detects the warm-up period, loops over channels and mux
 #' combinations, optionally filters the trace, and calls eventDetect to locate
-#' translocation events. Results are written incrementally to CSV files.
+#' events. Results are written incrementally to CSV files.
 #'
 #' @param direc               character  Working directory.
 #' @param folder              character  Sub-folder within `direc` (default: "").
@@ -1157,13 +1178,24 @@ runReadr <- function(direc,
 #' @param csv_name_list       character  Output CSV name stems, one per file.
 #' @param use_filter          logical  Apply Butterworth filter? (default: TRUE).
 #' @param sample_rate         numeric/NULL  Sampling rate in Hz. NULL = auto-detect.
-#' @param parallel            logical  Use parallel processing? (default: FALSE).
-#' @param offset_fix          logical  Apply offset correction? (default: TRUE).
+#' @param parallel            logical  Use parallel processing? (default: FALSE; currently unused).
+#' @param offset_fix          logical  Run offsetCorrect on the whole channel table? (default: TRUE).
+#'                              With the current eventDetect, which measures its own zero from the
+#'                              0 mV step, FALSE is recommended (see notes in the conversation).
+#' @param opc_fix             logical  Run the legacy opcFinder? (default: FALSE). eventDetect now
+#'                              estimates its own local baseline and ignores the `opc` column.
 #' @param resume              logical  Skip previously processed cms? (default: TRUE).
-#' @param ...                 Forwarded to besselFilt (filter_cutoff, filter_order,
-#'                              filter_type), offsetCorrect (method),
-#'                              opcFinder (sd_adjust), eventDetect
-#'                              (event_dwell_threshold).
+#' @param overwrite           logical  Only used when resume = FALSE and the output CSV already
+#'                              exists. FALSE (default) stops with an error, because eventDetect
+#'                              appends; TRUE deletes the existing CSV first (once per call).
+#' @param ...                 Forwarded by name:
+#'                              besselFilt: filter_cutoff, filter_order, filter_type;
+#'                              offsetCorrect: method; opcFinder: sd_adjust;
+#'                              eventDetect: ANY of its arguments (min_dwell, k_in, k_out,
+#'                              min_depth, merge_gap, block_s, trim_start, trim_end,
+#'                              amp_min_samples, long_min_s, zero_level, zero_trim).
+#'                              `event_dwell_threshold` is accepted as an alias for min_dwell.
+#'                              Unrecognised names give a warning.
 #'
 #' @return Invisible NULL. Results are written to CSV files.
 eventAna <- function(direc,
@@ -1175,21 +1207,36 @@ eventAna <- function(direc,
                      sample_rate       = 4000,
                      parallel          = FALSE,
                      offset_fix        = TRUE,
+                     opc_fix           = FALSE,
                      resume            = TRUE,
+                     overwrite         = FALSE,
                      ...) {
   
   dots <- list(...)
   
   filter_args <- list(
     filter_order  = dots$filter_order  %||% 2,
-    filter_cutoff = dots$filter_cutoff %||% 1500,
+    filter_cutoff = dots$filter_cutoff %||% 1000,
     filter_type   = dots$filter_type   %||% "low"
   )
   offset_args <- dots[names(dots) %in% "method"]
   opc_args    <- dots[names(dots) %in% "sd_adjust"]
-  event_args  <- dots[names(dots) %in% "event_dwell_threshold"]
+  
+  # Any eventDetect argument can be passed through eventAna(...)
+  ev_formals <- setdiff(names(formals(eventDetect)), c("input_df", "csv_out_path", "..."))
+  event_args <- dots[names(dots) %in% ev_formals]
+  if (!is.null(dots$event_dwell_threshold) && is.null(event_args$min_dwell))
+    event_args$min_dwell <- dots$event_dwell_threshold          # legacy alias
+  
+  known   <- c("filter_order", "filter_cutoff", "filter_type", "method", "sd_adjust",
+               "event_dwell_threshold", ev_formals)
+  unknown <- setdiff(names(dots), known)
+  if (length(unknown) > 0)
+    warning("eventAna: ignoring unrecognised argument(s): ",
+            paste(unknown, collapse = ", "), call. = FALSE)
   
   base_dir <- if (nchar(folder) > 0) file.path(direc, folder) else direc
+  started  <- character(0)    # output CSVs already handled in this call
   
   for (i in seq_along(data_file_list)) {
     
@@ -1202,6 +1249,28 @@ eventAna <- function(direc,
     
     message("\n=== File ", i, "/", length(data_file_list), ": ",
             basename(data_file), " (run: ", run_id, ") ===")
+    
+    # ── resume = FALSE does not overwrite: eventDetect appends, so existing rows would be duplicated ─
+    if (!isTRUE(resume) && !(csv_out %in% started) && file.exists(csv_out)) {
+      if (isTRUE(overwrite)) {
+        file.remove(csv_out)
+        message("Removed existing ", basename(csv_out), " (overwrite = TRUE)")
+      } else {
+        stop("eventAna: '", basename(csv_out), "' already exists and resume = FALSE. ",
+             "eventDetect appends to it, which would duplicate events. ",
+             "Use a new csv_name, delete the file, or pass overwrite = TRUE.", call. = FALSE)
+      }
+    }
+    started <- c(started, csv_out)
+    
+    # ── Refuse to append new-layout rows to a CSV written by the old detector ─
+    if (file.exists(csv_out)) {
+      hdr <- tryCatch(names(data.table::fread(csv_out, nrows = 0)),
+                      error = function(e) NULL)
+      if (!is.null(hdr) && !"event_class" %in% hdr)
+        stop("eventAna: '", basename(csv_out), "' has the old column layout (no event_class). ",
+             "Use a new csv_name or delete the file before rerunning.", call. = FALSE)
+    }
     
     # ── Resume: skip already-processed cms ──────────────────────────────────
     if (isTRUE(resume) && file.exists(csv_out)) {
@@ -1258,8 +1327,11 @@ eventAna <- function(direc,
       if (isTRUE(offset_fix))
         raw_data <- do.call(offsetCorrect, c(list(raw_data), offset_args))
       
-      raw_data <- do.call(opcFinder, c(list(raw_data), opc_args))
-      if (is.null(raw_data) || nrow(raw_data) == 0) next
+      # Legacy: eventDetect no longer uses the opc column, so this is off by default
+      if (isTRUE(opc_fix)) {
+        raw_data <- do.call(opcFinder, c(list(raw_data), opc_args))
+        if (is.null(raw_data) || nrow(raw_data) == 0) next
+      }
       
       for (cm_id in unique(raw_data$cm)) {
         cm_data <- raw_data[cm == cm_id]
@@ -1285,114 +1357,410 @@ eventAna <- function(direc,
 }
 
 
-#' Detect translocation events in a filtered current trace
 #'
-#' Identifies current blockade events as contiguous segments where the
-#' absolute current falls below the open-pore current estimate. Events
-#' shorter than `min_dwell` are discarded. Results are appended to a CSV.
+#' Detects nanopore events pereach voltage step from hysteresis-based
+#' thresholds
 #'
-#' @param input_df    data.table  Requires: current, time, voltage, opc, cm.
-#'                      Optionally: run_id.
-#' @param csv_out_path character  Path to the output CSV (appended to).
-#' @param min_dwell   numeric  Minimum event duration in seconds (default: 0.001).
-#' @param ...         Reserved; ignored.
 #'
-#' @return Invisible NULL. Events are written to `csv_out_path`.
+#' @param input_df              Data table containing current, time, voltage,
+#'                               cm, and run_id.
+#' @param csv_out_path          Output CSV path.
+#' @param min_dwell             Minimum event duration (s).
+#' @param k_in                  Trigger threshold in noise SDs.
+#' @param k_out                 Release threshold in noise SDs.
+#' @param min_depth             Minimum trigger depth relative to baseline.
+#' @param merge_gap             Maximum gap to bridge (s).
+#' @param block_s               Baseline block size (s).
+#' @param trim_start            Ignore this much time at each step's start (s).
+#' @param trim_end              Ignore this much time at each step's end (s).
+#' @param amp_min_samples       Minimum samples required for plateau amplitude.
+#' @param zero_level            User-supplied zero-current level (pA), or NULL.
+#' @param zero_trim             Trim each end of the 0 mV step for zero estimate.
+#' @param return_diag           Return per-sample diagnostics instead of events.
+#' @param ...                   Additional arguments reserved for compatibility.
+#'
+#' @return Writes detected events to CSV, or returns diagnostic data if requested.
+
 eventDetect <- function(input_df,
                         csv_out_path,
-                        min_dwell = 0.001,
+                        min_dwell          = 0.0007,
+                        k_in               = 4,
+                        k_out              = 2.5,
+                        min_depth          = 0.5,
+                        merge_gap          = 0.0001,
+                        block_s            = 1,
+                        trim_start         = 1,
+                        trim_end           = 0.5,
+                        amp_min_samples    = 3L,
+                        zero_level         = NULL,
+                        zero_trim          = 1,
+                        return_diag        = FALSE,
                         ...) {
   
-  if (!data.table::is.data.table(input_df))
-    data.table::setDT(input_df)
+  if (!is.data.table(input_df)) {
+    setDT(input_df)
+  }
   
   if (!"run_id" %in% names(input_df)) {
-    input_df[, run_id := "unknown_run"]
-    warning("eventDetect: 'run_id' column missing — using placeholder")
-  }
+    input_df[, run_id := "runid_missing"]  }
   
-  # Baseline at 0 mV
-  zero_curr <- if (any(input_df$voltage == 0)) {
-    tryCatch(
-      openPoreCalc(input_df[voltage == 0, current]),
-      error = function(e) { message("  Could not estimate 0 mV baseline; using 0"); 0 }
-    )
+  if (!"cm" %in% names(input_df)) {
+    input_df[, cm := NA_real_]
+  }
+  ## Output columns
+  out_cols <- c(
+    "cm", "avg_current", "plateau_current", "sd_current", "duration",
+    "t_start", "t_end", "amplitude", "amplitude_perc", "amp_peak",
+    "frac_below_zero", "opc", "event_class", "run_id", "voltage"
+  )
+  
+  
+  input_df[, v_step := rleid(voltage)]
+  
+  ## gte offsets from 0 mV step  
+  zero_curr <- if (!is.null(zero_level)) {
+    
+    zero_level
+    
+  } else if (any(input_df$voltage == 0, na.rm = TRUE)) {
+    
+    z <- input_df[
+      voltage == 0,
+      .(
+        current,
+        t_rel = time - min(time),
+        t_rem = max(time) - time
+      ),
+      by = v_step
+    ]
+    
+    z <- z[t_rel >= zero_trim & t_rem >= zero_trim]
+    
+    if (nrow(z) < 100) {
+      z <- input_df[voltage == 0, .(current)]
+    }
+    
+    modalAvg(z$current)
+    
   } else {
-    message("  No 0 mV data; using 0 as baseline")
+    
+    message("No 0 mV data; using 0 pA")
     0
+    
   }
   
-  voltages <- unique(input_df$voltage)
-  message(sprintf("  eventDetect: scanning %d voltage(s)", length(voltages)))
+  if (length(zero_curr) != 1L || !is.finite(zero_curr)) {
+    stop("eventDetect: invalid zero-current estimate.")
+  }
   
-  for (v in voltages) {
-    dt <- input_df[voltage == v]
-    if (nrow(dt) < 3) next
+  message(sprintf(
+    "eventDetect: zero-current level = %.2f pA%s",
+    zero_curr,
+    if (!is.null(zero_level)) " (set by user)" else ""
+  ))
+  
+  diag_list <- list()
+  
+  
+  for (s in unique(input_df$v_step)) {
     
-    dt <- dt[abs(current) < abs(opc)]
-    if (nrow(dt) < 2) next
+    dt <- input_df[v_step == s]
+    v  <- dt$voltage[1]
     
-    dt[, time := time - time[1]]
-    dt[, time_diff := c(0, diff(time))]
+    if (v == 0 || nrow(dt) < 1000) next
     
-    expected_step <- stats::median(dt$time_diff[dt$time_diff > 0])
-    if (is.na(expected_step) || expected_step == 0)
-      expected_step <- mean(diff(head(dt$time, 100)))
+    dt_s <- modalAvg(diff(dt$time))
     
-    dt[, event_id := cumsum(time_diff > (expected_step * 1.5))]
+    ## Remove transient spikes at step boundaries
+    dt <- dt[time - time[1] >= trim_start]
+    dt <- dt[time <= max(time) - trim_end]
     
-    event_sizes   <- dt[, .N, by = event_id]
-    valid_ids     <- event_sizes[N >= 2, event_id]
-    dt            <- dt[event_id %in% valid_ids]
-    if (nrow(dt) == 0) next
+    if (nrow(dt) < 1000) next
     
-    events_list   <- vector("list", length(unique(dt$event_id)))
-    event_counter <- 0L
+    ## Orient current according to voltage polarity and remove zero offset
+    x <- (dt$current - zero_curr) * sign(v)
     
-    for (eid in unique(dt$event_id)) {
-      ev       <- dt[event_id == eid]
-      if (nrow(ev) < 2) next
-      duration <- max(ev$time) - min(ev$time)
-      if (duration < min_dwell) next
-      
-      avg_curr <- stats::median(ev$current, na.rm = TRUE)
-      sd_curr  <- stats::sd(ev$current, na.rm = TRUE)
-      if (is.na(sd_curr)) sd_curr <- 0
-      
-    amplitude <- tryCatch({
-      denom <- ev$opc[1] - zero_curr
-      if (denom == 0) stop("opc equals zero-current baseline")
-      100 * (avg_curr - zero_curr) / denom
-      },
-      error = function(e) 100 * avg_curr / ev$opc[1]
+    ## baseline calcs
+    
+    base <- openPoreCalc(
+      x,
+      local = TRUE,
+      block_n = max(
+        200L,
+        as.integer(round(block_s / dt_s))
+      )
     )
+    
+    base <- as.numeric(base)
+    ## called med base, is actually mode
+    med_base <- modalAvg(base)
+    
+    if (!is.finite(med_base) || med_base <= 0) {
       
-      event_counter <- event_counter + 1L
-      events_list[[event_counter]] <- data.table::data.table(
-        cm          = ev$cm[1],
-        avg_current = avg_curr,
-        sd_current  = sd_curr,
-        duration    = duration,
-        amplitude   = amplitude,
-        opc         = ev$opc[1],
-        run_id      = ev$run_id[1],
-        voltage     = v
-      )
+      message(sprintf(
+        "    %+4d mV: baseline estimate failed (modal baseline = %s pA)",
+        v,
+        if (is.finite(med_base)) {
+          sprintf("%.4f", med_base)
+        } else {
+          "non-finite"
+        }
+      ))
+      
+      next
     }
     
-    if (event_counter > 0) {
-      events_df <- rbindlist(events_list[seq_len(event_counter)])
-      data.table::fwrite(
-        events_df, csv_out_path,
-        append    = file.exists(csv_out_path),
-        col.names = !file.exists(csv_out_path)
-      )
-      message(sprintf("    %+4d mV: %d event(s)", v, event_counter))
+    ## noise calcs used for event triggering
+    res <- x - base
+    
+    sigma <- median(
+      res[res > 0],
+      na.rm = TRUE
+    ) / 0.6745
+    
+    if (!is.finite(sigma) || sigma <= 0) {
+      
+      message(sprintf(
+        "    %+4d mV: noise estimate failed, skipping",
+        v
+      ))
+      
+      next
     }
+    
+    thr_in <- base - pmax(
+      k_in * sigma,
+      min_depth * base
+    )
+    
+    thr_out <- base - pmax(
+      k_out * sigma,
+      min_depth / 2 * base
+    )
+    
+    below <- x < thr_out
+    deep  <- x < thr_in
+    
+    ### merging small events
+    
+    merge_n <- max(
+      1L,
+      as.integer(round(merge_gap / dt_s))
+    )
+    
+    rl <- rle(below)
+    
+    if (length(rl$values) > 2) {
+      gap <- !rl$values & rl$lengths <= merge_n
+      gap[c(1, length(gap))] <- FALSE
+      rl$values[gap] <- TRUE
+      below <- inverse.rle(rl)
+    }
+    
+    ### vibe coded diags that were v useful
+    
+    if (return_diag) {
+      
+      keep <- seq.int(
+        1L,
+        length(x),
+        by = 4L
+      )
+      
+      diag_list[[length(diag_list) + 1L]] <-
+        data.table(
+          voltage = v,
+          time = dt$time[keep],
+          current = x[keep] * sign(v) + zero_curr,
+          base = base[keep] * sign(v) + zero_curr,
+          thr_in = thr_in[keep] * sign(v) + zero_curr,
+          thr_out = thr_out[keep] * sign(v) + zero_curr
+        )
+    }
+    
+    trig_depth <- 100 * median(
+      (base - thr_in) / base,
+      na.rm = TRUE
+    )
+    
+    
+    d <- data.table(
+      ev = rleid(below),
+      below = below,
+      deep = deep,
+      x = x,
+      base = base,
+      t = dt$time,
+      cm = dt$cm,
+      run_id = dt$run_id
+    )[below == TRUE]
+    
+    if (nrow(d) == 0) next
+    
+    ## Event measurements
+    ev <- d[, .(
+      n = .N,
+      any_deep = any(deep),
+      
+      med_x = median(x),
+      min_x = min(x),
+      
+      mid_x = if (.N >= max(amp_min_samples, 4L)) {
+        
+        k <- floor(.N * 0.25)
+        median(x[(k + 1L):(.N - k)])
+        
+      } else {
+        NA_real_
+      },
+      
+      sd_x = sd(x),
+      
+      med_base = median(base),
+      
+      frac_below_zero = mean(x < 0),
+      
+      t_start = min(t),
+      t_end = max(t),
+      
+      cm = cm[1],
+      run_id = run_id[1]
+      
+    ), by = ev]
+    
+    ev <- ev[any_deep == TRUE]
+    
+    ## Minimum event duration
+    ev[, duration := n * dt_s]
+    
+    ev <- ev[duration >= min_dwell]
+    
+    if (nrow(ev) == 0) next
+    
+    
+    ev[, open_raw := med_base + zero_curr * sign(v)]
+    
+    ## Difference between open-pore and event currents is
+    ## independent of the zero-current offset.
+    
+    ev[, event_depth := med_base - mid_x]
+    
+    ev[, amplitude := ifelse(
+      is.finite(open_raw) & abs(open_raw) > 0,
+      100 * event_depth / abs(open_raw),
+      NA_real_
+    )]
+    
+    ## Percentage reduction relative to raw open-pore current
+    ev[, amplitude_perc := ifelse(
+      is.finite(open_raw) & abs(open_raw) > 0,
+      100 * (med_base - mid_x) / abs(open_raw),
+      NA_real_
+    )]
+    
+    ev[, amp_peak := ifelse(
+      abs(open_raw) > 0,
+      100 * (med_base - min_x) / abs(open_raw),
+      NA_real_
+    )]
+    
+    
+    events_df <- ev[, .(
+      cm,
+      avg_current = med_x * sign(v) + zero_curr,
+      plateau_current = mid_x * sign(v) + zero_curr,
+      sd_current = sd_x,
+      duration,
+      t_start,
+      t_end,
+      amplitude,
+      amplitude_perc,
+      amp_peak,
+      frac_below_zero,
+      opc = med_base * sign(v) + zero_curr,
+      event_class = "event",
+      run_id,
+      voltage = v
+    )]
+    
+    
+    setcolorder(
+      events_df,
+      out_cols
+    )
+    
+    fwrite(
+      events_df,
+      csv_out_path,
+      append = file.exists(csv_out_path),
+      col.names = !file.exists(csv_out_path)
+    )
+    
+    message(sprintf(
+      paste0(
+        "    %+4d mV: %d event(s) ",
+        "(sigma = %.2f pA, trigger depth = %.0f%% of baseline)"
+      ),
+      v,
+      nrow(events_df),
+      sigma,
+      trig_depth
+    ))
+  }
+  
+  ### diags
+  
+  if (return_diag) {
+    
+    return(
+      rbindlist(
+        diag_list,
+        fill = TRUE
+      )
+    )
   }
   
   invisible(NULL)
 }
+
+
+
+eventDiagPlot <- function(diag_df, ev_df = NULL, t_range = NULL) {
+  # t_range is in seconds from the start of each voltage step (after trim_start)
+  diag_df <- data.table::copy(data.table::as.data.table(diag_df))
+  t0      <- diag_df[, .(t0 = min(time)), by = voltage]
+  diag_df <- merge(diag_df, t0, by = "voltage")
+  diag_df[, time := time - t0]
+  
+  if (!is.null(ev_df)) {
+    ev_df <- data.table::copy(data.table::as.data.table(ev_df))
+    ev_df <- merge(ev_df, t0, by = "voltage")
+    ev_df[, `:=`(t_start = t_start - t0, t_end = t_end - t0)]
+  }
+  
+  if (!is.null(t_range)) {
+    diag_df <- diag_df[time >= t_range[1] & time <= t_range[2]]
+    if (!is.null(ev_df))
+      ev_df <- ev_df[t_end >= t_range[1] & t_start <= t_range[2]]
+  }
+  
+  min_w <- diff(range(diag_df$time)) * 0.003   # make very short events visible
+  p <- ggplot2::ggplot(diag_df, ggplot2::aes(time))
+  if (!is.null(ev_df) && nrow(ev_df) > 0)
+    p <- p + ggplot2::geom_rect(
+      data = ev_df, inherit.aes = FALSE,
+      ggplot2::aes(xmin = t_start, xmax = pmax(t_end, t_start + min_w),
+                   ymin = -Inf, ymax = Inf),
+      fill = "orange", alpha = 0.4)
+  p +
+    ggplot2::geom_line(ggplot2::aes(y = current), colour = "grey30", linewidth = 0.2) +
+    ggplot2::geom_line(ggplot2::aes(y = base),    colour = "red") +
+    ggplot2::geom_line(ggplot2::aes(y = thr_in),  colour = "blue", linetype = "dashed") +
+    ggplot2::geom_line(ggplot2::aes(y = thr_out), colour = "steelblue", linetype = "dotted") +
+    ggplot2::facet_wrap(~voltage, scales = "free_y") +
+    ggplot2::labs(x = "Time from start of step (s)", y = "Current (pA)")
+}
+
 
 
 # ── Section 7: Metric Extraction ─────────────────────────────────────────────
@@ -1947,91 +2315,164 @@ eventPlotr <- function(input_df,
                        marker_size   = 1,
                        alpha_density = FALSE,
                        colour_by     = NULL,
-                       txt_size      = 7) {
+                       txt_size      = 7,
+                       facet_by_id = TRUE) {
   
+  # Choose colouring column, if available
   colour_col <- if (!is.null(colour_by)) {
     if (!colour_by %in% colnames(input_df))
       stop("eventPlotr: colour_by column '", colour_by, "' not found.")
     colour_by
-  } else "id"
+  } else if ("id" %in% colnames(input_df)) {
+    "id"
+  } else {
+    NULL
+  }
   
-  n_groups <- length(unique(input_df[[colour_col]]))
-  if (n_groups > length(cols)) cols <- rep(cols, length.out = n_groups)
+  # Number of groups determines colour palette length
+  n_groups <- if (!is.null(colour_col)) {
+    length(unique(input_df[[colour_col]]))
+  } else {
+    1
+  }
+  
+  if (n_groups > length(cols))
+    cols <- rep(cols, length.out = n_groups)
   
   log_x <- grepl("x", log_axes, ignore.case = TRUE)
   log_y <- grepl("y", log_axes, ignore.case = TRUE)
   
-  # ── Axis-scale helpers (DRY) ─────────────────────────────────────────────────
+  # ── Axis-scale helpers ──────────────────────────────────────────────────
   make_x_scale <- function(limits, log, reverse = FALSE) {
-    brk   <- stefBreaks(limits, log = if (log) "y" else NULL)
+    brk <- stefBreaks(limits, log = if (log) "y" else NULL)
+    
     trans <- if (log && reverse) c("log10", "reverse")
-    else if (log)        "log10"
-    else if (reverse)    "reverse"
-    else                 "identity"
+    else if (log) "log10"
+    else if (reverse) "reverse"
+    else "identity"
+    
     list(
-      ggplot2::scale_x_continuous(trans = trans, breaks = brk[[1]],
-                                  labels = brk[[2]], limits = limits),
-      if (log) ggplot2::annotation_logticks(sides = "b", size = marker_size / 4)
+      ggplot2::scale_x_continuous(
+        trans = trans, breaks = brk[[1]],
+        labels = brk[[2]], limits = limits
+      ),
+      if (log) ggplot2::annotation_logticks(
+        sides = "b", size = marker_size / 4
+      )
     )
   }
   
   make_y_scale <- function(limits, log, reverse = FALSE) {
-    brk   <- stefBreaks(limits, log = if (log) "y" else NULL)
+    brk <- stefBreaks(limits, log = if (log) "y" else NULL)
+    
     trans <- if (log && reverse) c("log10", "reverse")
-    else if (log)        "log10"
-    else if (reverse)    "reverse"
-    else                 "identity"
+    else if (log) "log10"
+    else if (reverse) "reverse"
+    else "identity"
+    
     list(
-      ggplot2::scale_y_continuous(trans = trans, breaks = brk[[1]],
-                                  labels = brk[[2]], limits = limits),
-      if (log) ggplot2::annotation_logticks(sides = "l", size = marker_size / 4)
+      ggplot2::scale_y_continuous(
+        trans = trans, breaks = brk[[1]],
+        labels = brk[[2]], limits = limits
+      ),
+      if (log) ggplot2::annotation_logticks(
+        sides = "l", size = marker_size / 4
+      )
     )
   }
   
-  # ── Plot ─────────────────────────────────────────────────────────────────────
+  # ── Plot ────────────────────────────────────────────────────────────────
   mode_char <- substr(tolower(mode), 1, 1)
   
   if (mode_char == "d") {
-    base_aes <- if (isTRUE(alpha_density)) {
-      ggplot2::aes(x = duration, y = amplitude,
-                   colour = .data[[colour_col]], alpha = ggplot2::after_stat(n))
+    
+    # Map colour only if a grouping column exists
+    base_aes <- if (is.null(colour_col)) {
+      ggplot2::aes(x = duration, y = amplitude)
+    } else if (isTRUE(alpha_density)) {
+      ggplot2::aes(
+        x = duration, y = amplitude,
+        colour = .data[[colour_col]],
+        alpha = ggplot2::after_stat(n)
+      )
     } else {
-      ggplot2::aes(x = duration, y = amplitude, colour = .data[[colour_col]])
+      ggplot2::aes(
+        x = duration, y = amplitude,
+        colour = .data[[colour_col]]
+      )
     }
     
     plt <- ggplot2::ggplot(input_df, base_aes) +
-      #ggplot2::geom_count(size = marker_size) +
-      #ggplot2::scale_size(range = c(marker_size, marker_size * 5))
-      ggplot2::geom_point(size = marker_size) +## unsure why count was used here, reverting
-      ggplot2::scale_color_manual(values = cols, name = "") +
-      ggplot2::xlab("Dwell Time (s)") + ggplot2::ylab("Amplitude (%)") +
-      { if (isTRUE(alpha_density)) ggplot2::guides(alpha = "none") }
+      ggplot2::geom_point(size = marker_size) +
+      ggplot2::xlab("Dwell Time (s)") +
+      ggplot2::ylab("Amplitude (%)")
     
-    if (!is.null(plot_xlim)) plt <- plt + make_x_scale(plot_xlim, log_x)
-    if (!is.null(plot_ylim)) plt <- plt + make_y_scale(plot_ylim, log_y, reverse = TRUE)
+    if (!is.null(colour_col)) {
+      plt <- plt +
+        ggplot2::scale_color_manual(values = cols, name = "")
+    } else {
+      plt <- plt +
+        ggplot2::scale_color_identity()
+    }
+    
+    if (isTRUE(alpha_density))
+      plt <- plt + ggplot2::guides(alpha = "none")
+    
+    if (!is.null(plot_xlim))
+      plt <- plt + make_x_scale(plot_xlim, log_x)
+    
+    if (!is.null(plot_ylim))
+      plt <- plt + make_y_scale(plot_ylim, log_y, reverse = TRUE)
     
   } else if (mode_char == "h") {
-    plt <- ggplot2::ggplot(input_df, ggplot2::aes(x = amplitude,
-                                                  fill = .data[[colour_col]])) +
-      ggplot2::geom_histogram(bins = n_bins) +
-      ggplot2::scale_fill_manual(values = cols, name = "") +
-      ggplot2::ylab("Frequency") + ggplot2::xlab("Amplitude (%)") +
+    
+    # Map fill only if a grouping column exists
+    base_aes <- if (is.null(colour_col)) {
+      ggplot2::aes(x = amplitude)
+    } else {
+      ggplot2::aes(x = amplitude, fill = .data[[colour_col]])
+    }
+    
+    plt <- ggplot2::ggplot(input_df, base_aes) +
+      ggplot2::geom_histogram(
+        bins = n_bins,
+        fill = if (is.null(colour_col)) cols[1] else NULL
+      ) +
+      ggplot2::ylab("Frequency") +
+      ggplot2::xlab("Amplitude (%)") +
       ggplot2::scale_x_continuous(trans = "reverse") +
       ggplot2::coord_flip()
     
-    if (!is.null(plot_xlim)) plt <- plt + make_x_scale(plot_xlim, log_x, reverse = TRUE)
-    if (!is.null(plot_ylim)) plt <- plt + make_y_scale(plot_ylim, log_y)
+    if (!is.null(colour_col)) {
+      plt <- plt +
+        ggplot2::scale_fill_manual(values = cols, name = "")
+    }
+    
+    if (!is.null(plot_xlim))
+      plt <- plt + make_x_scale(plot_xlim, log_x, reverse = TRUE)
+    
+    if (!is.null(plot_ylim))
+      plt <- plt + make_y_scale(plot_ylim, log_y)
     
   } else {
-    stop("eventPlotr: unknown mode '", mode, "'. Use 'histogram'/'h' or 'dwells'/'d'.")
+    stop(
+      "eventPlotr: unknown mode '", mode,
+      "'. Use 'histogram'/'h' or 'dwells'/'d'."
+    )
   }
+  
+  # Only facet by id if the column exists
+  if (facet_by_id && "id" %in% colnames(input_df))
+    plt <- plt + ggplot2::facet_grid(. ~ id)
   
   plt +
     ggplot2::theme_bw(base_size = txt_size) +
-    ggplot2::facet_grid(. ~ id) +
     My_Theme(txt_size = txt_size)
 }
 
+
+  
+#
 #' Plot an IV curve from per-voltage insertion metrics
 #'
 #' Aggregates current by voltage and condition group, overlays an optional
@@ -2331,6 +2772,7 @@ ivPlot <- function(input_df,
 hisPlot <- function(input_df,
                     colour_by   = NULL,
                     n_bins      = 10,
+                    hbinwd      = 0.25,
                     his_voltage = NULL,
                     per_channel = TRUE,
                     plot_groups = NULL,
@@ -2380,7 +2822,7 @@ hisPlot <- function(input_df,
     his_df,
     ggplot2::aes(x = per_chan_cond, fill = .data[[colour_col]])
   ) +
-    ggplot2::geom_histogram(bins = n_bins) +
+    ggplot2::geom_histogram(bins = n_bins, binwidth = hbinwd) +
     ggplot2::ylab("Counts") +
     ggplot2::xlab("Conductance / nS") +
     ggplot2::theme_bw(base_size = txt_size) +
@@ -2597,19 +3039,24 @@ hisPlot <- function(input_df,
 #'   group id.
 #' @param group_col    character/NULL  Column to split fits by. NULL
 #'   auto-detects from the plot's fill aesthetic.
+#' @param fit_groups   character/NULL  Groups to fit. NULL (default) fits all
+#'   groups. Pass a character vector of group names to fit only selected
+#'   groups. Other groups remain in the original histogram without fitted
+#'   curves.
 #' @param min_n        integer   Minimum observations required after
 #'   \code{fit_range} filtering before a fit is attempted (default 10). A
 #'   descriptive error is thrown if any group/facet subset falls below this.
 #'
 #' @return list: \code{plot} (ggplot with curves overlaid) and \code{peaks}
-#'   (data.frame with columns: id, [facet,] distribution, peak, error,
-#'   [fit_range_lo, fit_range_hi]).
+#'   (data.frame with columns: id, [facet,] distribution, peak, mean, mode,
+#'   error_of_fit, stdev, sem, [fit_range_lo, fit_range_hi]).
 hisFitr <- function(his_plot,
                     distribution = "auto",
                     fit_range    = NULL,
                     line_size    = 0.5,
                     line_colours = NULL,
                     group_col    = NULL,
+                    fit_groups   = NULL,
                     min_n        = 10L) {
   
   available <- c("auto", "normal", "gamma", "poisson", "exponential",
@@ -2641,16 +3088,22 @@ hisFitr <- function(his_plot,
                 "' from plot fill mapping.")
       }
     }
+    
     if (is.null(group_col)) {
       for (col in c("cond_group", "id")) {
-        if (col %in% colnames(his_data)) { group_col <- col; break }
+        if (col %in% colnames(his_data)) {
+          group_col <- col
+          break
+        }
       }
     }
+    
     if (is.null(group_col)) {
       message("hisFitr: no grouping column detected — fitting all data as one group.")
       his_data[["..all.."]] <- "all"
       group_col <- "..all.."
     }
+    
   } else {
     if (!group_col %in% colnames(his_data))
       stop("hisFitr: group_col '", group_col, "' not found in histogram data.\n",
@@ -2661,32 +3114,68 @@ hisFitr <- function(his_plot,
   message("hisFitr: splitting fits by column '", group_col, "'")
   
   # ---------------------------------------------------------------------------
-  # 3. Colour lookup
+  # 3. Split groups and select groups to fit
   # ---------------------------------------------------------------------------
   x_range <- ggplot2::layer_scales(his_plot)$x$range$range
   groups  <- split(his_data, his_data[[group_col]])
   
+  # Optionally restrict fitting to selected groups
+  if (!is.null(fit_groups)) {
+    
+    if (!is.character(fit_groups) || length(fit_groups) == 0L)
+      stop("hisFitr: fit_groups must be a non-empty character vector or NULL.")
+    
+    missing_groups <- setdiff(fit_groups, names(groups))
+    
+    if (length(missing_groups) > 0L)
+      stop("hisFitr: fit_groups contains unknown group(s): ",
+           paste(missing_groups, collapse = ", "),
+           "\n  Available groups: ",
+           paste(names(groups), collapse = ", "))
+    
+    groups <- groups[names(groups) %in% fit_groups]
+    
+    message("hisFitr: fitting selected group(s): ",
+            paste(names(groups), collapse = ", "))
+    
+  } else {
+    message("hisFitr: fitting all ", length(groups), " groups.")
+  }
+  
+  # ---------------------------------------------------------------------------
+  # 4. Colour lookup
+  # ---------------------------------------------------------------------------
   group_ids     <- names(groups)
   n_groups      <- length(group_ids)
+  
   colour_lookup <- if (is.null(line_colours)) {
+    
     stats::setNames(rep("black", n_groups), group_ids)
+    
   } else if (!is.null(names(line_colours))) {
+    
     missing_ids <- setdiff(group_ids, names(line_colours))
+    
     if (length(missing_ids) > 0L)
       warning("hisFitr: no line colour specified for group(s): ",
               paste(missing_ids, collapse = ", "), " — using black.")
+    
     defaults <- stats::setNames(rep("black", n_groups), group_ids)
     defaults[names(line_colours)] <- line_colours
     defaults
+    
   } else {
+    
     stats::setNames(rep(line_colours, length.out = n_groups), group_ids)
   }
   
   # ---------------------------------------------------------------------------
-  # 4. AIC-based distribution selection
+  # 5. AIC-based distribution selection
   # ---------------------------------------------------------------------------
   select_best_dist <- function(x) {
+    
     candidates <- setdiff(available, "auto")
+    
     aics <- vapply(candidates, function(d) {
       tryCatch({
         f <- MASS::fitdistr(x, d)
@@ -2698,15 +3187,18 @@ hisFitr <- function(his_plot,
       stop("hisFitr: no distributions could be fitted.")
     
     best <- candidates[which.min(aics)]
+    
     message("    Auto-selected: ", best,
             " (AIC = ", round(min(aics[is.finite(aics)]), 2L), ")")
+    
     list(fit = MASS::fitdistr(x, best), dist = best)
   }
   
   # ---------------------------------------------------------------------------
-  # 5. Density function builder
+  # 6. Density function builder
   # ---------------------------------------------------------------------------
   make_dens_fn <- function(dist_used, est) {
+    
     switch(dist_used,
            normal      = function(x) stats::dnorm(x,  est["mean"],     est["sd"]),
            gamma       = function(x) stats::dgamma(x, est["shape"],    est["rate"]),
@@ -2722,9 +3214,10 @@ hisFitr <- function(his_plot,
   }
   
   # ---------------------------------------------------------------------------
-  # 6. Analytic peak helper
+  # 7. Analytic peak helper
   # ---------------------------------------------------------------------------
   analytic_peak <- function(dist_used, est, dens_fn, x_range) {
+    
     peak_g <- switch(dist_used,
                      normal      = est["mean"],
                      gamma       = if (est["shape"] > 1) (est["shape"] - 1) / est["rate"] else NA,
@@ -2745,24 +3238,30 @@ hisFitr <- function(his_plot,
     } else {
       message("    Peak (analytic): ", round(peak_g, 4L))
     }
+    
     peak_g
   }
   
   # ---------------------------------------------------------------------------
-  # 7. Main fitting loop — outer: group, inner: facet subset
+  # 8. Main fitting loop — outer: group, inner: facet subset
   # ---------------------------------------------------------------------------
   all_results <- vector("list", length(groups))
   
   for (i in seq_along(groups)) {
+    
     gdata <- groups[[i]]
     gid   <- names(groups)[i]
     
     dist_req <- if (length(distribution) > 1L) {
+      
       if (!gid %in% names(distribution))
         stop("hisFitr: no distribution specified for group '", gid,
              "'. Provided names: ", paste(names(distribution), collapse = ", "))
+      
       as.character(distribution[[gid]])
+      
     } else {
+      
       as.character(distribution)
     }
     
@@ -2770,9 +3269,12 @@ hisFitr <- function(his_plot,
     
     # Split by facet (if any)
     if (length(facet_vars) > 0L) {
+      
       facet_key     <- do.call(paste, c(gdata[facet_vars], sep = "__"))
       facet_subsets <- split(gdata, facet_key)
+      
     } else {
+      
       facet_subsets        <- list(gdata)
       names(facet_subsets) <- gid
     }
@@ -2780,6 +3282,7 @@ hisFitr <- function(his_plot,
     sub_results <- vector("list", length(facet_subsets))
     
     for (j in seq_along(facet_subsets)) {
+      
       fdata    <- facet_subsets[[j]]
       facet_id <- names(facet_subsets)[j]
       
@@ -2791,9 +3294,12 @@ hisFitr <- function(his_plot,
       rng <- .resolve_fit_range(fit_range, gid, facet_id)
       
       if (!is.null(rng)) {
+        
         fdata_fit <- fdata[fdata$per_chan_cond >= rng[1L] &
                              fdata$per_chan_cond <= rng[2L], ]
+        
         n_fit <- nrow(fdata_fit)
+        
         message("    fit_range [", rng[1L], ", ", rng[2L], "] — ",
                 n_fit, " / ", nrow(fdata), " observations retained for fitting.")
         
@@ -2809,7 +3315,9 @@ hisFitr <- function(his_plot,
             "  → Widen fit_range, or set min_n to a lower value if a fit ",
             "is still meaningful with fewer observations."
           )
+        
       } else {
+        
         fdata_fit <- fdata
       }
       
@@ -2817,11 +3325,15 @@ hisFitr <- function(his_plot,
       # Fit distribution (on filtered data only)
       # -----------------------------------------------------------------------
       if (dist_req == "auto") {
+        
         res       <- select_best_dist(fdata_fit$per_chan_cond)
         fit       <- res$fit
         dist_used <- res$dist
+        
       } else {
+        
         dist_used <- dist_req
+        
         fit <- tryCatch(
           MASS::fitdistr(fdata_fit$per_chan_cond, dist_used),
           error = function(e)
@@ -2833,10 +3345,11 @@ hisFitr <- function(his_plot,
       # -----------------------------------------------------------------------
       # Build density curve over the FULL axis range (not just fit_range)
       # -----------------------------------------------------------------------
-      x_vals    <- seq(min(x_range), max(x_range), length.out = 1000L)
-      est       <- fit$estimate
-      dens_fn   <- make_dens_fn(dist_used, est)
-      raw_dens  <- dens_fn(x_vals)
+      x_vals  <- seq(min(x_range), max(x_range), length.out = 1000L)
+      est     <- fit$estimate
+      dens_fn <- make_dens_fn(dist_used, est)
+      
+      raw_dens <- dens_fn(x_vals)
       
       # Scale to per-panel histogram peak using unfiltered fdata
       panel_peak  <- .panel_hist_peak(gg_build, fdata, facet_vars)
@@ -2844,10 +3357,13 @@ hisFitr <- function(his_plot,
       
       peak_g <- analytic_peak(dist_used, est, dens_fn, x_range)
       
-      # curve_df carries facet variable columns so ggplot routes correctly
+      # -----------------------------------------------------------------------
+      # Build fitted curve dataframe
+      # -----------------------------------------------------------------------
       curve_df      <- data.frame(x = x_vals, y = scaled_dens, id = gid)
       curve_df$y[curve_df$y <= 0] <- NA
       
+      # Add facet variables so ggplot routes the curve correctly
       for (fv in facet_vars) {
         curve_df[[fv]] <- fdata[[fv]][1L]
       }
@@ -2861,13 +3377,21 @@ hisFitr <- function(his_plot,
           inherit.aes = FALSE
         )
       
+      # -----------------------------------------------------------------------
+      # Store results
+      # -----------------------------------------------------------------------
       sub_results[[j]] <- data.frame(
         id           = gid,
         facet        = facet_id,
         distribution = dist_used,
         n_hist       = nrow(fdata),
         peak         = as.numeric(peak_g),
-        error        = min(fit$sd, na.rm = TRUE),
+        mean         = mean(fdata_fit$per_chan_cond, na.rm = TRUE),
+        mode         = modalAvg(fdata_fit$per_chan_cond),
+        error_of_fit = min(fit$sd, na.rm = TRUE),
+        stdev        = stats::sd(fdata_fit$per_chan_cond),
+        sem          = stats::sd(fdata_fit$per_chan_cond) /
+          sqrt(sum(!is.na(fdata_fit$per_chan_cond))),
         fit_range_lo = if (!is.null(rng)) rng[1L] else NA_real_,
         fit_range_hi = if (!is.null(rng)) rng[2L] else NA_real_
       )
@@ -2876,420 +3400,24 @@ hisFitr <- function(his_plot,
     all_results[[i]] <- do.call(rbind, sub_results)
   }
   
+  # ---------------------------------------------------------------------------
+  # 9. Combine results
+  # ---------------------------------------------------------------------------
   peaks_df <- do.call(rbind, all_results)
   
   # Drop columns that carry no information in the non-faceted / no-range case
-  if (length(facet_vars) == 0L)     peaks_df$facet        <- NULL
+  if (length(facet_vars) == 0L)
+    peaks_df$facet <- NULL
+  
   if (all(is.na(peaks_df$fit_range_lo))) {
     peaks_df$fit_range_lo <- NULL
     peaks_df$fit_range_hi <- NULL
   }
   
   print(peaks_df)
+  
   list(plot = his_plot, peaks = peaks_df)
 }
-
-### legacy code left in for posterity
-
-#' 
-#' #' Plot an IV curve from per-voltage insertion metrics
-#' #'
-#' #' Aggregates current by voltage and condition group, overlays an optional
-#' #' linear conductance fit, and prints conductance statistics to the console.
-#' #'
-#' #' @param input_df       data.frame  Requires: per_voltage_current, voltage.
-#' #'                         Optional: cond_group, id.
-#' #' @param show_fit       logical  TRUE (default) overlays a linear fit.
-#' #' @param fit_formula    character  lm formula string (default: "y~x+0").
-#' #' @param fit_voltage    numeric vector  Voltage range for the fit
-#' #'                         (default: c(-100, 100)).
-#' #' @param avg_type       character  "mode" (default), "mean", or "median".
-#' #' @param plot_groups    character/NULL  Restrict to these cond_group values.
-#' #' @param cols           character/NULL  Colours per group.
-#' #' @param plot_xlim      numeric/NULL  X-axis limits.
-#' #' @param plot_ylim      numeric/NULL  Y-axis limits.
-#' #' @param error_type     character  "sem" (default) or "stdev".
-#' #' @param marker_size    numeric  Point and line width.
-#' #' @param offset_zero    logical  TRUE shifts current so V = 0 → I = 0.
-#' #' @param txt_size       numeric  Base font size.
-#' #' @param fit_colour     character/NULL  Fit line colour. NULL → coloured by group.
-#' #' @param drop_zero_v    logical  TRUE (default) drops voltage = 0 rows.
-#' #' @param output         character  "plot" returns ggplot; "data" returns the
-#' #'                         aggregated data frame.
-#' #'
-#' #' @return ggplot object or data.frame depending on `output`.
-#' ivPlot <- function(input_df,
-#'                    show_fit     = TRUE,
-#'                    fit_formula  = "y~x+0",
-#'                    fit_voltage  = c(-100, 100),
-#'                    avg_type     = "mode",
-#'                    plot_groups  = NULL,
-#'                    cols         = NULL,
-#'                    plot_xlim    = NULL,
-#'                    plot_ylim    = NULL,
-#'                    error_type   = "sem",
-#'                    marker_size  = 1,
-#'                    offset_zero  = FALSE,
-#'                    txt_size     = 7,
-#'                    fit_colour   = "black",
-#'                    drop_zero_v  = TRUE,
-#'                    output       = "plot") {
-#'   
-#'   if (!"cond_group" %in% names(input_df))
-#'     input_df$cond_group <- if ("id" %in% names(input_df)) input_df$id else "ungrouped"
-#'   
-#'   if (!"per_voltage_current" %in% names(input_df))
-#'     input_df$per_voltage_current <- input_df$current
-#'   
-#'   input_df$per_voltage_current <- as.numeric(input_df$per_voltage_current)
-#'   input_df$voltage             <- as.numeric(input_df$voltage)
-#'   
-#'   if (is.null(plot_groups)) plot_groups <- unique(input_df$cond_group)
-#'   if (is.null(fit_voltage)) fit_voltage <- range(input_df$voltage)
-#'   fit_voltage <- seq(fit_voltage[1], fit_voltage[2])
-#'   
-#'   # ── Aggregate ────────────────────────────────────────────────────────────────
-#'   grp_vars <- if ("id" %in% names(input_df)) c("cond_group", "voltage", "id")
-#'   else c("cond_group", "voltage")
-#'   
-#'   avg_fn  <- if (avg_type == "mode") modalAvg else get(avg_type)
-#'   # plot_df <- stats::aggregate(
-#'   #   per_voltage_current ~ .,
-#'   #   data = input_df[, c(grp_vars, "per_voltage_current")],
-#'   #   FUN  = avg_fn
-#'   # )
-#'   plot_df <- input_df[
-#'     ,
-#'     .(per_voltage_current = avg_fn(per_voltage_current)),
-#'     by = grp_vars
-#'   ]
-#'   # ── Error bars ───────────────────────────────────────────────────────────────
-#'   sd_df   <- stats::aggregate(per_voltage_current ~ voltage + cond_group, input_df, sd)
-#'   n_df    <- stats::aggregate(per_voltage_current ~ voltage + cond_group, input_df, length)
-#'   err_df  <- merge(sd_df, n_df, by = c("voltage", "cond_group"))
-#'   names(err_df)[3:4] <- c("stdev", "n")
-#'   err_df$sem <- err_df$stdev / sqrt(err_df$n)
-#'   plot_df    <- merge(plot_df, err_df, by = c("voltage", "cond_group"))
-#'   
-#'   ap_df <- subset(plot_df, plot_df$cond_group %in% plot_groups)
-#'   
-#'   if (isTRUE(offset_zero))
-#'     ap_df$per_voltage_current <- ap_df$per_voltage_current -
-#'     ap_df$per_voltage_current[ap_df$voltage == 0]
-#'   
-#'   if (isTRUE(drop_zero_v)) {
-#'     message("ivPlot: dropping voltage = 0 rows (note: affects offset correction)")
-#'     ap_df <- subset(ap_df, ap_df$voltage != 0)
-#'   }
-#'   
-#'   err_col <- if (tolower(error_type) == "stdev") "stdev" else "sem"
-#'   
-#'   plt <- ggplot2::ggplot(
-#'     ap_df,
-#'     ggplot2::aes(
-#'       x = voltage, y = per_voltage_current, colour = cond_group,
-#'       ymin = per_voltage_current - .data[[err_col]],
-#'       ymax = per_voltage_current + .data[[err_col]]
-#'     )
-#'   ) +
-#'     ggplot2::geom_point(size = marker_size) +
-#'     ggplot2::geom_errorbar(width = 2, alpha = 0.5, linewidth = marker_size) +
-#'     ggplot2::geom_hline(yintercept = 0, colour = "grey",
-#'                         linetype = "dashed", linewidth = marker_size) +
-#'     ggplot2::geom_vline(xintercept = 0, colour = "grey",
-#'                         linetype = "dashed", linewidth = marker_size) +
-#'     ggplot2::xlab("Voltage (mV)") + ggplot2::ylab("Current (pA)") +
-#'     My_Theme(base_size = txt_size, txt_size = txt_size) +
-#'     ggplot2::theme(legend.title = ggplot2::element_blank())
-#'   
-#'   # ── Conductance fit ──────────────────────────────────────────────────────────
-#'   plot_df$cond <- plot_df$per_voltage_current / plot_df$voltage
-#'   
-#'   if (isTRUE(show_fit)) {
-#'     for (grp in unique(plot_df$cond_group)) {
-#'       tmp      <- stats::na.omit(subset(plot_df, plot_df$cond_group == grp))
-#'       tmp      <- subset(tmp, !is.infinite(tmp$cond))
-#'       tmp$y    <- tmp$per_voltage_current
-#'       tmp$x    <- tmp$voltage
-#'       model    <- try(stats::lm(
-#'         formula = as.formula(fit_formula),
-#'         data    = subset(tmp, tmp$voltage %in% fit_voltage)
-#'       ))
-#'       message("ivPlot: conductance for group '", grp, "'")
-#'       if (!inherits(model, "try-error")) {
-#'         message("  Linear fit:")
-#'         print(summary(model)$coefficients)
-#'         message("  Modal average: ", modalAvg(tmp$cond), " ± ", sd(tmp$cond), " nS")
-#'       }
-#'     }
-#'     
-#'     fit_df <- subset(ap_df, ap_df$voltage %in% fit_voltage)
-#'     plt <- plt + ggplot2::geom_smooth(
-#'       data      = fit_df,
-#'       ggplot2::aes(colour = cond_group),
-#'       method    = "lm",
-#'       formula   = as.formula(fit_formula),
-#'       se        = FALSE,
-#'       linewidth = marker_size,
-#'       colour    = fit_colour
-#'     )
-#'   }
-#'   
-#'   if (!is.null(cols))      plt <- plt + ggplot2::scale_colour_manual(values = cols)
-#'   if (!is.null(plot_ylim)) plt <- plt + ggplot2::scale_y_continuous(
-#'     breaks = stefBreaks(plot_ylim)[[1]],
-#'     labels = stefBreaks(plot_ylim)[[2]], limits = plot_ylim
-#'   )
-#'   if (!is.null(plot_xlim)) plt <- plt + ggplot2::scale_x_continuous(
-#'     breaks = stefBreaks(plot_xlim)[[1]],
-#'     labels = stefBreaks(plot_xlim)[[2]], limits = plot_xlim
-#'   )
-#'   
-#'   if (output == "plot") return(plt)
-#'   if (output == "data") return(ap_df)
-#'   stop("ivPlot: output must be 'plot' or 'data'.")
-#' }
-#' 
-#' 
-#' #' Plot a conductance histogram
-#' #'
-#' #' @param input_df    data.frame  Requires: per_voltage_cond or per_chan_cond,
-#' #'                     voltage, cm. Optional: cond_group, id.
-#' #' @param n_bins      integer  Number of histogram bins (default: 10).
-#' #' @param his_voltage numeric/NULL  Restrict to this voltage before plotting.
-#' #' @param per_channel logical  TRUE uses per_chan_cond (averaged over all
-#' #'                     voltages); FALSE uses per_voltage_cond at his_voltage.
-#' #' @param plot_groups character/NULL  Restrict to these cond_group values.
-#' #' @param cols        character/NULL  Fill colours per group.
-#' #' @param plot_ylim   numeric/NULL  Y-axis limits.
-#' #' @param plot_xlim   numeric/NULL  X-axis limits.
-#' #' @param show_n      logical  TRUE annotates with pore count (n).
-#' #' @param n_x         numeric/NULL  X position of n label (auto if NULL).
-#' #' @param n_y         numeric/NULL  Y position of n label (auto if NULL).
-#' #' @param txt_size    numeric  Base font size (default: 7).
-#' #'
-#' #' @return ggplot object.
-#' hisPlot <- function(input_df,
-#'                     n_bins      = 10,
-#'                     his_voltage = NULL,
-#'                     per_channel = TRUE,
-#'                     plot_groups = NULL,
-#'                     cols        = NULL,
-#'                     plot_ylim   = NULL,
-#'                     plot_xlim   = NULL,
-#'                     show_n      = TRUE,
-#'                     n_x         = NULL,
-#'                     n_y         = NULL,
-#'                     txt_size    = 7) {
-#'   
-#'   if (!is.null(plot_groups))
-#'     input_df <- subset(input_df, input_df$cond_group %in% plot_groups)
-#'   
-#'   his_df <- if (!is.null(his_voltage)) {
-#'     subset(input_df, input_df$voltage %in% his_voltage)
-#'   } else {
-#'     input_df
-#'   }
-#'   
-#'   if (!isTRUE(per_channel)) {
-#'     message("hisPlot: using per-voltage conductance — set his_voltage to avoid inflated n.")
-#'     his_df$per_chan_cond <- his_df$per_voltage_cond
-#'   }
-#'   
-#'   his_df$per_chan_cond <- abs(as.numeric(his_df$per_chan_cond))
-#'   his_df               <- subset(his_df, his_df$per_chan_cond > 0.00001)
-#'   
-#'   fill_aes <- if ("cond_group" %in% colnames(input_df)) {
-#'     ggplot2::aes(x = per_chan_cond, fill = cond_group)
-#'   } else if ("id" %in% colnames(input_df)) {
-#'     ggplot2::aes(x = per_chan_cond, fill = id)
-#'   } else {
-#'     ggplot2::aes(x = per_chan_cond)
-#'   }
-#'   
-#'   if (!is.null(cols) && length(cols) < length(unique(input_df$cond_group)))
-#'     cols <- rep(cols, length.out = length(unique(input_df$cond_group)))
-#'   
-#'   plt <- ggplot2::ggplot(his_df, fill_aes) +
-#'     ggplot2::geom_histogram(bins = n_bins) +
-#'     ggplot2::ylab("Counts") + ggplot2::xlab("Conductance / nS") +
-#'     ggplot2::theme_bw(base_size = txt_size) +
-#'     My_Theme(base_size = txt_size, txt_size = txt_size) +
-#'     ggplot2::theme(legend.title = ggplot2::element_blank())
-#'   
-#'   if (!is.null(cols))      plt <- plt + ggplot2::scale_fill_manual(values = cols)
-#'   if (!is.null(plot_ylim)) plt <- plt + ggplot2::scale_y_continuous(
-#'     breaks = stefBreaks(plot_ylim)[[1]],
-#'     labels = stefBreaks(plot_ylim)[[2]], limits = plot_ylim
-#'   )
-#'   if (!is.null(plot_xlim)) plt <- plt + ggplot2::scale_x_continuous(
-#'     breaks = stefBreaks(plot_xlim)[[1]],
-#'     labels = stefBreaks(plot_xlim)[[2]], limits = plot_xlim
-#'   )
-#'   
-#'   if (isTRUE(show_n)) {
-#'     n   <- length(unique(his_df$cm))
-#'     n_x <- n_x %||% (max(his_df$per_chan_cond) * 0.75)
-#'     n_y <- n_y %||% (n / 10)
-#'     plt <- plt + ggplot2::annotate("text", x = n_x, y = n_y,
-#'                                    label = paste0("n = ", n),
-#'                                    size  = txt_size / ggplot2::.pt)
-#'   }
-#'   
-#'   return(plt)
-#' }
-#' 
-#' 
-#' #' Fit probability distributions to a conductance histogram
-#' #'
-#' #' Adds fitted distribution curves to a hisPlot output and returns the
-#' #' estimated peak conductance per group. Supports automatic model selection
-#' #' by AIC, a single distribution applied to all groups, or different
-#' #' distributions per group.
-#' #'
-#' #' @param his_plot     ggplot  Output of hisPlot (or any ggplot histogram).
-#' #' @param distribution character/named character vector  Distribution(s) to fit:
-#' #'   "auto", "normal", "gamma", "poisson", "exponential", "lognormal",
-#' #'   "beta", "weibull", "logistic", "chisq", or "geom". Pass a named vector
-#' #'   to assign different distributions per group (names must match group IDs).
-#' #' @param line_size    numeric  Fitted curve line thickness (default: 0.5).
-#' #' @param group_col    character  Name of the grouping column in the histogram
-#' #'   data (default: "id").
-#' #'
-#' #' @return list:
-#' #'   $plot   ggplot with fitted curves overlaid.
-#' #'   $peaks  data.frame (id, distribution, peak, error).
-#' hisFitr <- function(his_plot,
-#'                     distribution = "auto",
-#'                     line_size    = 0.5,
-#'                     group_col    = "id") {
-#'   
-#'   available <- c("auto", "normal", "gamma", "poisson", "exponential",
-#'                  "lognormal", "beta", "weibull", "logistic", "chisq", "geom")
-#'   message("hisFitr: available distributions: ", paste(available, collapse = ", "))
-#'   
-#'   # ── AIC-based automatic selection ───────────────────────────────────────────
-#'   select_best_dist <- function(x) {
-#'     candidates <- setdiff(available, "auto")
-#'     aics <- vapply(candidates, function(d) {
-#'       tryCatch({
-#'         f <- MASS::fitdistr(x, d)
-#'         2 * length(f$estimate) - 2 * f$loglik
-#'       }, error = function(e) Inf)
-#'     }, numeric(1))
-#'     
-#'     if (all(is.infinite(aics)))
-#'       stop("hisFitr: no distributions could be fitted to this group.")
-#'     
-#'     best <- candidates[which.min(aics)]
-#'     message("  Auto-selected: ", best, " (AIC = ", round(min(aics), 2), ")")
-#'     list(fit = MASS::fitdistr(x, best), dist = best)
-#'   }
-#'   
-#'   # ── Extract histogram data ───────────────────────────────────────────────────
-#'   gg_build  <- ggplot2::ggplot_build(his_plot)
-#'   his_data  <- stats::na.omit(gg_build$plot$data)
-#'   x_range   <- ggplot2::layer_scales(his_plot)$x$range$range
-#'   hist_peak <- max(gg_build$data[[1]]$count)
-#'   
-#'   groups <- if (group_col %in% colnames(his_data)) {
-#'     split(his_data, his_data[[group_col]])
-#'   } else {
-#'     list(all = his_data)
-#'   }
-#'   
-#'   results <- vector("list", length(groups))
-#'   
-#'   for (i in seq_along(groups)) {
-#'     gdata    <- groups[[i]]
-#'     gid      <- names(groups)[i]
-#'     
-#'     # Determine which distribution to use for this group
-#'     dist_req <- if (length(distribution) > 1) {
-#'       if (!gid %in% names(distribution))
-#'         stop("hisFitr: no distribution specified for group '", gid, "'.")
-#'       as.character(distribution[gid])
-#'     } else {
-#'       as.character(distribution)
-#'     }
-#'     
-#'     if (dist_req == "auto") {
-#'       res          <- select_best_dist(gdata$per_chan_cond)
-#'       fit          <- res$fit
-#'       dist_used    <- res$dist
-#'     } else {
-#'       dist_used    <- dist_req
-#'       fit          <- MASS::fitdistr(gdata$per_chan_cond, dist_used)
-#'     }
-#'     
-#'     message("hisFitr: group '", gid, "' — fitting ", dist_used)
-#'     
-#'     # ── Density curve ────────────────────────────────────────────────────────
-#'     x_vals <- seq(min(x_range), max(x_range), length.out = 1000)
-#'     est    <- fit$estimate
-#'     
-#'     dens_fn <- switch(dist_used,
-#'                       normal      = function(x) stats::dnorm(x, est["mean"], est["sd"]),
-#'                       gamma       = function(x) stats::dgamma(x, est["shape"], est["rate"]),
-#'                       poisson     = function(x) stats::dpois(x, est["lambda"]),
-#'                       exponential = function(x) stats::dexp(x, est["rate"]),
-#'                       lognormal   = function(x) stats::dlnorm(x, est["meanlog"], est["sdlog"]),
-#'                       beta        = function(x) stats::dbeta(x, est["shape1"], est["shape2"]),
-#'                       weibull     = function(x) stats::dweibull(x, est["shape"], est["scale"]),
-#'                       logistic    = function(x) stats::dlogis(x, est["location"], est["scale"]),
-#'                       chisq       = function(x) stats::dchisq(x, est["df"]),
-#'                       geom        = function(x) stats::dgeom(x, est["prob"])
-#'     )
-#'     
-#'     raw_dens   <- dens_fn(x_vals)
-#'     scaled_dens <- raw_dens * (hist_peak / max(raw_dens, na.rm = TRUE))
-#'     
-#'     # ── Peak conductance (analytic where possible) ────────────────────────────
-#'     peak_g <- switch(dist_used,
-#'                      normal      = est["mean"],
-#'                      gamma       = if (est["shape"] > 1) (est["shape"] - 1) / est["rate"] else NA,
-#'                      exponential = 0,
-#'                      lognormal   = exp(est["meanlog"] - est["sdlog"]^2),
-#'                      weibull     = if (est["shape"] > 1)
-#'                        est["scale"] * ((est["shape"] - 1) / est["shape"])^(1 / est["shape"])
-#'                      else 0,
-#'                      chisq       = if (est["df"] >= 2) est["df"] - 2 else 0,
-#'                      logistic    = est["location"],
-#'                      NA_real_
-#'     )
-#'     
-#'     if (is.na(peak_g)) {
-#'       opt    <- stats::optimize(function(x) -dens_fn(x),
-#'                                 interval = c(min(x_range), max(x_range)))
-#'       peak_g <- opt$minimum
-#'     }
-#'     
-#'     curve_df <- data.frame(x = x_vals, y = scaled_dens, id = gid)
-#'     curve_df$y[curve_df$y <= 0] <- NA
-#'     
-#'     his_plot <- his_plot +
-#'       ggplot2::geom_line(
-#'         data         = curve_df,
-#'         ggplot2::aes(x = x, y = y, group = id),
-#'         size         = line_size,
-#'         colour       = "black",
-#'         inherit.aes  = FALSE
-#'       )
-#'     
-#'     results[[i]] <- data.frame(
-#'       id           = gid,
-#'       distribution = dist_used,
-#'       peak         = peak_g,
-#'       error        = min(fit$sd, na.rm = TRUE)
-#'     )
-#'   }
-#'   
-#'   peaks_df <- do.call(rbind, results)
-#'   print(peaks_df)
-#'   
-#'   return(list(plot = his_plot, peaks = peaks_df))
-#' }
-
 
 # ── Section 11: Clustering ────────────────────────────────────────────────────
 
